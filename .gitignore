@@ -1,0 +1,7 @@
+dist/
+lumen/
+.gradle/
+build/
+android/local.properties
+*.iml
+.idea/

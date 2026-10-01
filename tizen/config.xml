@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget xmlns="http://www.w3.org/ns/widgets" xmlns:tizen="http://tizen.org/ns/widgets"
+        id="https://github.com/Karl-Lauterbach24/Lumen-TV" version="@VERSION@" viewmodes="maximized">
+    <tizen:application id="LumenTV001.LumenTV" package="LumenTV001" required_version="2.4"/>
+    <content src="index.html"/>
+    <feature name="http://tizen.org/feature/screen.size.all"/>
+    <icon src="appicon.png"/>
+    <name>Lumen TV</name>
+    <description>Receiver for the Lumen player: plays what Lumen casts on the local network.</description>
+    <author href="https://github.com/Karl-Lauterbach24/Lumen-TV">Lumen</author>
+    <!-- Lumen runs on a computer in the local network, reached by its IP address over HTTP -->
+    <access origin="*" subdomains="true"/>
+    <tizen:privilege name="http://tizen.org/privilege/internet"/>
+    <tizen:privilege name="http://tizen.org/privilege/tv.inputdevice"/>
+    <tizen:privilege name="http://developer.samsung.com/privilege/network.public"/>
+    <tizen:privilege name="http://developer.samsung.com/privilege/productinfo"/>
+    <tizen:profile name="tv-samsung"/>
+    <tizen:setting screen-orientation="landscape" context-menu="disable" background-support="disable"
+                   encryption="disable" install-location="auto" hwkey-event="enable"/>
+</widget>

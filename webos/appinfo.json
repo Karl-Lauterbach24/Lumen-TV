@@ -1,0 +1,14 @@
+{
+  "id": "io.github.lumen.tv",
+  "version": "@VERSION@",
+  "vendor": "Lumen",
+  "type": "web",
+  "main": "index.html",
+  "title": "Lumen TV",
+  "appDescription": "Receiver for the Lumen player: plays what Lumen casts on the local network.",
+  "icon": "icon80.png",
+  "largeIcon": "icon130.png",
+  "bgColor": "#0a0b0e",
+  "resolution": "1920x1080",
+  "disableBackHistoryAPI": true
+}

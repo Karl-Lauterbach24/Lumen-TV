@@ -1,0 +1,96 @@
+# Builds the TV apps. A tag "v<version>" also creates a GitHub release with the packages.
+name: Build
+
+on:
+  push:
+    branches: [main, "feature/**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  web:
+    name: Tizen + webOS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Receiver page from the Lumen repository
+        run: git clone -q --depth 1 --branch "$(cat LUMEN_REF)" https://github.com/Karl-Lauterbach24/Lumen lumen
+      - name: Assemble the apps
+        run: |
+          python3 tools/build_web.py --lumen lumen
+          # the platform files must be valid JavaScript
+          for f in dist/tizen/platform.js dist/webos/platform.js dist/tizen/receiver.js; do node --check "$f"; done
+          python3 -c "import json; json.load(open('dist/webos/appinfo.json'))"
+          python3 -c "import xml.dom.minidom as m; m.parse('dist/tizen/config.xml')"
+      - name: LG package (ares-package)
+        run: |
+          npm install -g @webos-tools/cli
+          ares-package dist/webos -o dist
+          ls -la dist
+      - uses: actions/upload-artifact@v5
+        with:
+          name: web
+          path: |
+            dist/*.wgt
+            dist/*.ipk
+          if-no-files-found: error
+
+  android:
+    name: Android TV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Receiver texts from the Lumen repository
+        run: |
+          git clone -q --depth 1 --branch "$(cat LUMEN_REF)" https://github.com/Karl-Lauterbach24/Lumen lumen
+          python3 tools/gen_android_strings.py --lumen lumen
+          git diff --exit-code -- android/app/src/main/res || { echo "::error::Android texts are out of date: run tools/gen_android_strings.py"; exit 1; }
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+      - name: Build
+        run: |
+          set -o pipefail
+          if ! gradle -p android :app:assembleDebug --console=plain 2>&1 | tee gradle.log; then
+            body=$(grep -E "^e: |error:|FAILED|What went wrong|> " gradle.log | head -30 | cut -c1-300 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=gradle::$body"
+            exit 1
+          fi
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk "dist/LumenTV-$(cat VERSION)-android.apk"
+          ls -la dist
+      - uses: actions/upload-artifact@v5
+        with:
+          name: android
+          path: dist/*.apk
+          if-no-files-found: error
+
+  release:
+    needs: [web, android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          path: assets
+          merge-multiple: true
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          VER=$(cat ../VERSION)
+          NOTES="../docs/release-notes/$VER.md"
+          [ -f "$NOTES" ] || { echo "Lumen TV $VER" > /tmp/notes.md; NOTES=/tmp/notes.md; }
+          gh release create "v$VER" * --repo "$GITHUB_REPOSITORY" --title "Lumen TV $VER" --notes-file "$NOTES"
