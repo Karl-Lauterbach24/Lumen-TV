@@ -1,4 +1,4 @@
-# Builds the TV apps. A tag "v<version>" also creates a GitHub release with the packages.
+# Builds the TV apps. A tag "v<version>" also creates a draft GitHub release with the packages.
 name: Build
 
 on:
@@ -93,4 +93,5 @@ jobs:
           VER=$(cat ../VERSION)
           NOTES="../docs/release-notes/$VER.md"
           [ -f "$NOTES" ] || { echo "Lumen TV $VER" > /tmp/notes.md; NOTES=/tmp/notes.md; }
-          gh release create "v$VER" * --repo "$GITHUB_REPOSITORY" --title "Lumen TV $VER" --notes-file "$NOTES"
+          # a draft: it becomes public when it is published on the Releases page
+          gh release create "v$VER" * --repo "$GITHUB_REPOSITORY" --title "Lumen TV $VER" --notes-file "$NOTES" --draft
