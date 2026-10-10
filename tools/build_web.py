@@ -19,7 +19,10 @@ import sys
 import zipfile
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RECEIVER = ["index.html", "receiver.js", "receiver.css", "icon.png", "hls.light.min.js"]
+# every file of Lumen's receiver folder except platform.js (that one is the platform's own)
+def receiver_files(lumen):
+    return sorted(n for n in os.listdir(os.path.join(lumen, "receiver"))
+                  if n != "platform.js" and os.path.isfile(os.path.join(lumen, "receiver", n)))
 
 
 def read(path):
@@ -36,7 +39,7 @@ def assemble(lumen, out, platform, extra):
     target = os.path.join(out, platform)
     shutil.rmtree(target, ignore_errors=True)
     os.makedirs(target)
-    for name in RECEIVER:
+    for name in receiver_files(lumen):
         src = os.path.join(lumen, "receiver", name)
         if not os.path.exists(src):
             sys.exit("missing in the Lumen checkout: receiver/" + name)

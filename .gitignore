@@ -1,7 +1,9 @@
 dist/
-lumen/
+/lumen/
 .gradle/
 build/
 android/local.properties
 *.iml
 .idea/
+android/app/src/main/assets/
+android/.kotlin/
