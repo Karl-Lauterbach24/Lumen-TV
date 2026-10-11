@@ -226,6 +226,7 @@ class MainActivity : Activity() {
         android.util.Log.i("LumenTV", "bd event $type $value")
         when (type) {
             Bd.EV_ENCRYPTED -> js("window.lumenToast&&window.lumenToast('This disc is encrypted and cannot be played.',7000)")
+            Bd.EV_SOUND -> bd?.playSound(value)
             Bd.EV_ERROR -> js("window.lumenToast&&window.lumenToast('The disc could not be played.',7000)")
         }
     }

@@ -307,10 +307,45 @@ JNIEXPORT jlong JNICALL Java_io_github_lumen_tv_Bd_nTime(JNIEnv *env, jobject se
 JNIEXPORT jlong JNICALL Java_io_github_lumen_tv_Bd_nSeekTime(JNIEnv *env, jobject self, jlong t) { return g_bluray ? (jlong)bd_seek_time(g_bluray, (uint64_t)t) : -1; }
 JNIEXPORT jint JNICALL Java_io_github_lumen_tv_Bd_nSkipStill(JNIEnv *env, jobject self) { return g_bluray ? bd_read_skip_still(g_bluray) : 0; }
 
+/* a sound effect of the disc's menu (sound.bdmv): [channels, samples ...] 48 kHz 16 bit, or null */
+JNIEXPORT jshortArray JNICALL Java_io_github_lumen_tv_Bd_nSound(JNIEnv *env, jobject self, jint id)
+{
+    BLURAY_SOUND_EFFECT fx;
+    if (!g_bluray || bd_get_sound_effect(g_bluray, (unsigned)id, &fx) <= 0 || !fx.samples || !fx.num_frames) return NULL;
+    int n = fx.num_frames * fx.num_channels;
+    jshortArray a = (*env)->NewShortArray(env, n + 1);
+    if (!a) return NULL;
+    jshort ch = fx.num_channels;
+    (*env)->SetShortArrayRegion(env, a, 0, 1, &ch);
+    (*env)->SetShortArrayRegion(env, a, 1, n, (const jshort *)fx.samples);
+    return a;
+}
+
+/* events that bd_read_ext() handed out with the data are kept here until Kotlin asks */
+static int64_t g_evq[64];
+static int g_evh, g_evt;
+static pthread_mutex_t g_evlock = PTHREAD_MUTEX_INITIALIZER;
+static void ev_push(int64_t v)
+{
+    pthread_mutex_lock(&g_evlock);
+    if ((g_evt + 1) % 64 != g_evh) { g_evq[g_evt] = v; g_evt = (g_evt + 1) % 64; }
+    pthread_mutex_unlock(&g_evlock);
+}
+static int64_t ev_pop(void)
+{
+    int64_t v = 0;
+    pthread_mutex_lock(&g_evlock);
+    if (g_evh != g_evt) { v = g_evq[g_evh]; g_evh = (g_evh + 1) % 64; }
+    pthread_mutex_unlock(&g_evlock);
+    return v;
+}
+
 /* events as (type << 32 | value); 0 = none */
 JNIEXPORT jlong JNICALL Java_io_github_lumen_tv_Bd_nEvent(JNIEnv *env, jobject self)
 {
     BD_EVENT ev;
+    int64_t q = ev_pop();
+    if (q) return q;
     if (!g_bluray || !bd_get_event(g_bluray, &ev) || ev.event == BD_EVENT_NONE) return 0;
     return ((jlong)ev.event << 32) | (uint32_t)ev.param;
 }
@@ -386,7 +421,9 @@ JNIEXPORT jint JNICALL Java_io_github_lumen_tv_Bd_nRead(JNIEnv *env, jobject sel
     if (packets > 32) packets = 32;
     if (packets < 1) return 0;
     /* libbluray returns whole aligned units (6144 bytes) at least */
+    ev.event = BD_EVENT_NONE;
     int n = bd_read_ext(g_bluray, tmp, 6144 > packets * 192 ? 6144 : packets * 192, &ev);
+    if (ev.event != BD_EVENT_NONE) ev_push(((int64_t)ev.event << 32) | (uint32_t)ev.param);
     if (n < 0) return -1;
     if (n == 0) return 0;
     int w = 0;
