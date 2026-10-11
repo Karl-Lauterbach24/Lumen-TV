@@ -7,3 +7,4 @@ android/local.properties
 .idea/
 android/app/src/main/assets/
 android/.kotlin/
+.DS_Store

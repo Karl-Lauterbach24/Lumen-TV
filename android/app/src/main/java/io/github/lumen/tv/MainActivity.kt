@@ -43,7 +43,9 @@ class MainActivity : Activity() {
     private var player: ExoPlayer? = null
     private val main = Handler(Looper.getMainLooper())
     private lateinit var drives: Drives
+    private lateinit var discs: Discs
     private var pageReady = false
+    private var lastLogged = -1L
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -51,7 +53,8 @@ class MainActivity : Activity() {
         setContentView(R.layout.activity_main)
         playerView = findViewById(R.id.player)
         web = findViewById(R.id.web)
-        drives = Drives(this)
+        discs = Discs(this) { js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()") }
+        drives = Drives(this, discs)
 
         web.setBackgroundColor(Color.TRANSPARENT)
         web.settings.apply {
@@ -60,6 +63,7 @@ class MainActivity : Activity() {
             mediaPlaybackRequiresUserGesture = false
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW   // Lumen answers over http in the local network
             allowFileAccess = false
+            textZoom = 100                                              // the page is laid out in its own units
         }
         val loader = WebViewAssetLoader.Builder()
             .addPathHandler("/", WebViewAssetLoader.AssetsPathHandler(this))
@@ -106,6 +110,10 @@ class MainActivity : Activity() {
     private fun event(name: String) {
         val p = player ?: return
         val dur = if (p.duration > 0) p.duration else 0
+        if (name == "timeupdate" && p.currentPosition / 5000 != lastLogged) {
+            lastLogged = p.currentPosition / 5000
+            android.util.Log.i("LumenTV", "position ${p.currentPosition} duration ${p.duration} seekable ${p.isCurrentMediaItemSeekable}")
+        }
         js("window.__lumenEvent&&window.__lumenEvent('$name',${p.currentPosition},$dur,${if (p.isPlaying || (p.playWhenReady && p.playbackState == Player.STATE_BUFFERING)) "false" else "true"})")
     }
 
@@ -113,15 +121,48 @@ class MainActivity : Activity() {
         main.post { if (pageReady) web.evaluateJavascript(code, null) }
     }
 
-    private fun open(uri: Uri, hls: Boolean) {
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun open(uri: Uri, hls: Boolean, prepared: androidx.media3.extractor.ExtractorsFactory? = null) {
         val p = ensurePlayer()
-        val item = MediaItem.Builder().setUri(uri).apply { if (hls) setMimeType(MimeTypes.APPLICATION_M3U8) }.build()
-        p.setMediaItem(item)
+        if (uri.scheme == "disc") {
+            // a file of a disc the app reads itself
+            val factory = DiscDataSource.Factory { key, path -> discs.reader(key, path) }
+            // a Blu-ray title: the length and seeking from the stream's clock (see BdavSeek)
+            val extractors: androidx.media3.extractor.ExtractorsFactory = prepared ?: androidx.media3.extractor.DefaultExtractorsFactory()
+            val source = androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(factory, extractors)
+                .createMediaSource(MediaItem.fromUri(uri))
+            p.setMediaSource(source)
+        } else if (prepared != null) {
+            val source = androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(androidx.media3.datasource.DefaultDataSource.Factory(this), prepared)
+                .createMediaSource(MediaItem.fromUri(uri))
+            p.setMediaSource(source)
+        } else {
+            val item = MediaItem.Builder().setUri(uri).apply { if (hls) setMimeType(MimeTypes.APPLICATION_M3U8) }.build()
+            p.setMediaItem(item)
+        }
         p.playWhenReady = true
         p.prepare()
         playerView.visibility = View.VISIBLE
         main.removeCallbacks(tick)
         main.post(tick)
+    }
+
+    /** Work that reads from the disc, done off the main thread before the player is asked. */
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun prepare(uri: Uri): androidx.media3.extractor.ExtractorsFactory? {
+        val path = uri.path.orEmpty().removePrefix("/")
+        return try {
+            if (uri.scheme == "disc" && path.endsWith(".m2ts", true)) {
+                val r = discs.reader(uri.host ?: "", path) ?: return null
+                val d = BdavSeek.duration(r, 192)
+                if (d > 0) ProportionalTsFactory(d, r.size / 192 * 188) else null
+            } else if (uri.scheme == "file" && path.endsWith(".ts", true)) {
+                // a transport stream the app wrote itself (a copied disc title)
+                val r = LocalFileReader(java.io.File(path))
+                val d = BdavSeek.duration(r, 188)
+                if (d > 0) ProportionalTsFactory(d, r.size) else null
+            } else null
+        } catch (_: Exception) { null }
     }
 
     private fun closePlayer() {
@@ -164,6 +205,7 @@ class MainActivity : Activity() {
         main.removeCallbacks(tick)
         player?.release()
         player = null
+        discs.close()
         web.destroy()
         super.onDestroy()
     }
@@ -184,12 +226,25 @@ class MainActivity : Activity() {
 
         @JavascriptInterface fun exit() { main.post { finish() } }
 
-        @JavascriptInterface fun play(url: String, hls: Boolean) { main.post { open(Uri.parse(url), hls) } }
+        @JavascriptInterface fun play(url: String, hls: Boolean) { kotlin.concurrent.thread { val u = Uri.parse(url); val prepared = prepare(u); main.post { open(u, hls, prepared) } } }
         @JavascriptInterface fun resume() { main.post { player?.play() } }
         @JavascriptInterface fun pause() { main.post { player?.pause() } }
         @JavascriptInterface fun seek(ms: Double) { main.post { player?.seekTo(ms.toLong()) } }
         @JavascriptInterface fun stop() { main.post { closePlayer() } }
 
+        @JavascriptInterface fun act(id: Int, path: String) {
+            val key = path.removePrefix("disc:").substringBefore('|')
+            val what = path.substringAfter('|')
+            val say = { msg: String -> js("window.lumenToast&&window.lumenToast(${JSONObject.quote(msg)},6000)") }
+            kotlin.concurrent.thread {
+                when (what) {
+                    "#rip" -> discs.rip(key, say)
+                    "#keys" -> discs.loadKeyDatabase(say)
+                    else -> discs.copy(key, say)
+                }
+                reply(id, "[]")
+            }
+        }
         @JavascriptInterface fun drives(id: Int) { drives.list { json -> reply(id, json) } }
         @JavascriptInterface fun folder(id: Int, path: String) { drives.folder(path) { json -> reply(id, json) } }
 

@@ -9,6 +9,7 @@ import android.os.storage.StorageManager
 import android.provider.MediaStore
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import kotlin.concurrent.thread
 
 /**
@@ -18,7 +19,7 @@ import kotlin.concurrent.thread
  * has indexed it hands out through MediaStore – with the folder each file lies in. So folders are
  * built from the indexed files: a folder with no film in it (below) does not show.
  */
-class Drives(private val activity: Activity) {
+class Drives(private val activity: Activity, private val discs: Discs) {
     private var waiting = mutableListOf<() -> Unit>()
     private var asked = false
 
@@ -67,6 +68,10 @@ class Drives(private val activity: Activity) {
             thread {
                 val a = JSONArray()
                 for (v in volumes()) a.put(JSONObject().put("name", v.name).put("path", v.media + "|").put("detail", v.detail))
+                val found = discs.volumes(discs.refresh())
+                for (i in 0 until found.length()) a.put(found.get(i))
+                if (discs.copiedFolder().listFiles().orEmpty().any { it.isDirectory })
+                    a.put(JSONObject().put("name", "Copied discs").put("path", "app|").put("detail", ""))
                 done(a.toString())
             }
         }, { done("[]") })
@@ -77,6 +82,22 @@ class Drives(private val activity: Activity) {
         if (bar < 0) { done("[]"); return }
         val volume = path.substring(0, bar)
         val rel = path.substring(bar + 1)
+        // a disc (its files are read from the disc itself, no permission needed)
+        if (volume.startsWith("disc:")) { thread { done(discs.folder(volume.removePrefix("disc:"), rel).toString()) }; return }
+        // what the app copied from discs
+        if (volume == "app") {
+            thread {
+                val a = JSONArray()
+                val dir = File(discs.copiedFolder(), rel)
+                for (f in dir.listFiles().orEmpty().sortedBy { it.name }) {
+                    if (f.isDirectory) a.put(JSONObject().put("name", f.name).put("path", "app|$rel${f.name}/").put("dir", true).put("size", 0))
+                    else a.put(JSONObject().put("name", f.name).put("path", "app|$rel${f.name}").put("dir", false).put("size", f.length())
+                        .put("uri", android.net.Uri.fromFile(f).toString()).put("video", true))
+                }
+                done(a.toString())
+            }
+            return
+        }
         withPermission({
             thread { done(read(volume, rel).toString()) }
         }, { done("[]") })

@@ -82,7 +82,10 @@
         proxy(video, onFail);
         N.play(entry.uri, false);
       },
-      detach: function (video) { release(video); }
+      detach: function (video) { release(video); },
+      // an action of a disc ("copy"): messages arrive as toasts
+      act: function (path, done) { ask('act', path, function () { done(); }); },
+      watch: function (cb) { window.__lumenDrivesChanged = cb; }
     },
 
     keys: {}
