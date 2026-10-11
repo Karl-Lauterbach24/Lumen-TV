@@ -22,6 +22,7 @@ import kotlin.concurrent.thread
 class Drives(private val activity: Activity, private val discs: Discs) {
     private var waiting = mutableListOf<() -> Unit>()
     private var asked = false
+    var onPermission: (() -> Unit)? = null
 
     private fun permissions(): Array<String> =
         if (Build.VERSION.SDK_INT >= 33) arrayOf(Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.READ_MEDIA_AUDIO)
@@ -46,6 +47,7 @@ class Drives(private val activity: Activity, private val discs: Discs) {
         synchronized(this) { run = waiting.toList(); waiting.clear() }
         asked = false
         if (ok) run.forEach { it() }
+        onPermission?.invoke()
     }
 
     private data class Volume(val media: String, val name: String, val detail: String)
@@ -64,17 +66,21 @@ class Drives(private val activity: Activity, private val discs: Discs) {
     }
 
     fun list(done: (String) -> Unit) {
-        withPermission({
-            thread {
-                val a = JSONArray()
+        thread {
+            val a = JSONArray()
+            // the discs do not depend on the storage permission: they are read through USB directly
+            val found = discs.volumes(discs.refresh())
+            for (i in 0 until found.length()) a.put(found.get(i))
+            if (granted()) {
                 for (v in volumes()) a.put(JSONObject().put("name", v.name).put("path", v.media + "|").put("detail", v.detail))
-                val found = discs.volumes(discs.refresh())
-                for (i in 0 until found.length()) a.put(found.get(i))
-                if (discs.copiedFolder().listFiles().orEmpty().any { it.isDirectory })
-                    a.put(JSONObject().put("name", "Copied discs").put("path", "app|").put("detail", ""))
-                done(a.toString())
+            } else if (!asked) {
+                asked = true
+                activity.runOnUiThread { activity.requestPermissions(permissions(), 77) }
             }
-        }, { done("[]") })
+            if (discs.copiedFolder().listFiles().orEmpty().any { it.isDirectory })
+                a.put(JSONObject().put("name", "Copied discs").put("path", "app|").put("detail", ""))
+            done(a.toString())
+        }
     }
 
     fun folder(path: String, done: (String) -> Unit) {

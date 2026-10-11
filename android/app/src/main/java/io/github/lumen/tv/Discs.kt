@@ -125,12 +125,39 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     // ---- what is there ----
     private fun imageFolder(): File? = activity.getExternalFilesDir(null)
 
-    /** All discs now present. Blocks while a drive spins up (call from a worker thread). */
+    private val refreshLock = java.util.concurrent.locks.ReentrantLock()
+    @Volatile private var last: List<Disc> = emptyList()
+    private val opening = HashSet<String>()
+    private var lastAsked = HashMap<String, Long>()
+    /** USB devices that are not taken for an optical drive, as short descriptions (for the list, so a user can see what the television sees). */
+    @Volatile var unsupported: List<String> = emptyList()
+        private set
+
+    private fun describeDevice(device: UsbDevice): String {
+        val ifs = (0 until device.interfaceCount).map { device.getInterface(it) }
+            .joinToString(" ") { "%d/%d/%02x".format(it.interfaceClass, it.interfaceSubclass, it.interfaceProtocol) }
+        val vp = "%04x:%04x".format(device.vendorId, device.productId)
+        return "${device.productName ?: device.manufacturerName ?: "USB device"} ($vp, interfaces $ifs)"
+    }
+
+    /** All discs now present. Never waits for a drive: a drive that is still being read is listed as "reading". */
     fun refresh(): List<Disc> {
+        if (!refreshLock.tryLock()) return last
+        try { return refreshLocked().also { last = it } } finally { refreshLock.unlock() }
+    }
+
+    private fun refreshLocked(): List<Disc> {
         val out = ArrayList<Disc>()
         val present = HashSet<String>()
+        val other = ArrayList<String>()
         for ((name, device) in usb.deviceList) {
-            val iface = UsbBlockSource.find(device) ?: continue
+            val iface = UsbBlockSource.find(device)
+            if (iface == null) {
+                // hubs, keyboards, ... are not interesting; storage and unknown things are shown, so one can see what arrives
+                val classes = (0 until device.interfaceCount).map { device.getInterface(it).interfaceClass }
+                if (device.deviceClass != 9 && classes.any { it == 8 || it == 255 || it == 0 }) other.add(describeDevice(device))
+                continue
+            }
             val key = "usb$name"
             present.add(key)
             val cached = synchronized(open) { open[key] }
@@ -140,19 +167,35 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
                     (cached.source as? UsbBlockSource)?.mediaChanged() == true
                 if (!stale) { if (cached.encrypted) lookupKeys(cached); out.add(cached); continue }
                 synchronized(open) { open.remove(key)?.source?.close() }
-                // (the connection is reopened below)
             }
             if (!usb.hasPermission(device)) {
-                if (asked.add(key)) {
+                val now = System.currentTimeMillis()
+                if (now - (lastAsked[key] ?: 0L) > 30_000) {         // (asks again if the dialog was dismissed)
+                    lastAsked[key] = now
                     val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
-                    usb.requestPermission(device, PendingIntent.getBroadcast(activity, 0, Intent(action).setPackage(activity.packageName), flags))
+                    try { usb.requestPermission(device, PendingIntent.getBroadcast(activity, 0, Intent(action).setPackage(activity.packageName), flags)) }
+                    catch (e: Exception) { android.util.Log.w("LumenTV", "USB permission request failed: $e") }
                 }
                 out.add(Disc(key, device.productName ?: "Disc drive", "", null, null, false, "permission"))
                 continue
             }
-            val disc = openDrive(key, device, iface)
-            if (disc != null) { synchronized(open) { open[key] = disc }; out.add(disc) }
+            // the drive is read on its own thread (spinning up takes up to half a minute); the page hears of it when done
+            out.add(Disc(key, device.productName ?: "Disc drive", "", null, null, false, "reading"))
+            val start = synchronized(opening) { opening.add(key) }
+            if (start) kotlin.concurrent.thread {
+                try {
+                    val disc = openDrive(key, device, iface)
+                    if (disc != null) synchronized(open) { open[key] = disc }
+                    else other.add(describeDevice(device) + " – not an optical drive or not readable")
+                } catch (e: Exception) {
+                    android.util.Log.w("LumenTV", "opening the drive failed: $e")
+                } finally {
+                    synchronized(opening) { opening.remove(key) }
+                    changed()
+                }
+            }
         }
+        unsupported = other
         synchronized(open) {
             val gone = open.keys.filter { it.startsWith("usb") && it !in present }
             gone.forEach { open.remove(it)?.source?.close() }
@@ -209,13 +252,15 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         val a = JSONArray()
         for (d in discs) {
             val detail = when (d.note) {
-                "permission" -> "waiting for permission"
+                "permission" -> "waiting for permission (answer the dialog of the television)"
+                "reading" -> "reading the disc …"
                 "empty" -> "no disc"
                 "unreadable" -> "cannot be read"
                 else -> listOf(d.kind, if (d.encrypted) (if (d.keys != null) "AACS, key known" else "AACS") else "").filter { it.isNotEmpty() }.joinToString(" · ")
             }
             a.put(JSONObject().put("name", d.label).put("path", "disc:${d.key}|").put("detail", detail))
         }
+        for (u in unsupported) a.put(JSONObject().put("name", u).put("path", "").put("detail", "not usable").put("off", true))
         return a
     }
 

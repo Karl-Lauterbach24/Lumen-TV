@@ -63,6 +63,7 @@ class MainActivity : Activity() {
         bdIg = findViewById(R.id.bdIg)
         discs = Discs(this) { js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()") }
         drives = Drives(this, discs)
+        drives.onPermission = { js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()") }
 
         web.setBackgroundColor(Color.TRANSPARENT)
         web.settings.apply {

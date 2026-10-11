@@ -37,7 +37,8 @@ class UsbBlockSource private constructor(
             for (i in 0 until device.interfaceCount) {
                 val f = device.getInterface(i)
                 // class 8 = mass storage; subclass 2 (MMC-5, SFF-8020i) or 6 (transparent SCSI); protocol 0x50 = bulk-only
-                if (f.interfaceClass == UsbConstants.USB_CLASS_MASS_STORAGE && (f.interfaceSubclass == 2 || f.interfaceSubclass == 6) && f.interfaceProtocol == 0x50)
+                // (some bridges name another subclass; bulk-only is what this speaks)
+                if (f.interfaceClass == UsbConstants.USB_CLASS_MASS_STORAGE && f.interfaceProtocol == 0x50 && f.endpointCount >= 2)
                     return f
             }
             return null
