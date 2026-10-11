@@ -11,6 +11,13 @@ class MkvTest {
     fun ripsAClip() {
         val image = System.getenv("MKV_TEST_IMAGE")
         val out = System.getenv("MKV_TEST_OUT")
+        val raw = System.getenv("MKV_TEST_FILE")
+        if (raw != null && out != null) {
+            val res = MkvRipper(LocalFileReader(File(raw)), 192).rip(File(out), "raw", { _, _ -> }, { false })
+            println("ripped raw: ${res.tracks} ${res.warnings} ${res.seconds}")
+            assertTrue(res.tracks.isNotEmpty())
+            return
+        }
         assumeTrue(image != null && out != null && File(image).exists())
         val udf = Udf(FileBlockSource(image!!))
         val db = System.getenv("MKV_TEST_KEYDB")

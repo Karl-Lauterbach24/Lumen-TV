@@ -21,4 +21,16 @@
         android:layout_height="match_parent"
         android:focusable="true"
         android:focusableInTouchMode="true" />
+
+    <!-- the menu of a disc played with its menus (libbluray): subtitles below, the menu above -->
+    <FrameLayout
+        android:id="@+id/bdOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone">
+        <ImageView android:id="@+id/bdPg" android:layout_width="match_parent" android:layout_height="match_parent"
+            android:scaleType="fitXY" android:importantForAccessibility="no" />
+        <ImageView android:id="@+id/bdIg" android:layout_width="match_parent" android:layout_height="match_parent"
+            android:scaleType="fitXY" android:importantForAccessibility="no" />
+    </FrameLayout>
 </FrameLayout>

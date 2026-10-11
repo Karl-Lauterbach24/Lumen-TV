@@ -45,6 +45,11 @@ class MainActivity : Activity() {
     private lateinit var drives: Drives
     private lateinit var discs: Discs
     private var pageReady = false
+    private var bd: Bd? = null
+    private lateinit var bdOverlay: android.view.View
+    private lateinit var bdPg: android.widget.ImageView
+    private lateinit var bdIg: android.widget.ImageView
+    private val bdBitmaps = arrayOfNulls<android.graphics.Bitmap>(2)
     private var lastLogged = -1L
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -53,6 +58,9 @@ class MainActivity : Activity() {
         setContentView(R.layout.activity_main)
         playerView = findViewById(R.id.player)
         web = findViewById(R.id.web)
+        bdOverlay = findViewById(R.id.bdOverlay)
+        bdPg = findViewById(R.id.bdPg)
+        bdIg = findViewById(R.id.bdIg)
         discs = Discs(this) { js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()") }
         drives = Drives(this, discs)
 
@@ -82,7 +90,10 @@ class MainActivity : Activity() {
     private fun ensurePlayer(): ExoPlayer {
         player?.let { return it }
         val factory = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
-        val p = ExoPlayer.Builder(this, factory).build()
+        // a short look-ahead: the menu of a disc runs ahead of the picture by what the player has buffered
+        val load = androidx.media3.exoplayer.DefaultLoadControl.Builder()
+            .setBufferDurationsMs(2000, 4000, 800, 1500).build()
+        val p = ExoPlayer.Builder(this, factory).setLoadControl(load).build()
         p.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 when (state) {
@@ -92,7 +103,18 @@ class MainActivity : Activity() {
                 }
             }
             override fun onIsPlayingChanged(isPlaying: Boolean) { event(if (isPlaying) "playing" else "pause") }
-            override fun onPlayerError(error: PlaybackException) { event("error") }
+            override fun onPlayerError(error: PlaybackException) {
+                val why = when (error.errorCode) {
+                    PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES,
+                    PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED,
+                    PlaybackException.ERROR_CODE_DECODER_INIT_FAILED -> "This television cannot decode this video (its format or resolution)."
+                    PlaybackException.ERROR_CODE_IO_UNSPECIFIED, PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND ->
+                        "The disc or file could not be read."
+                    else -> "Playback stopped: ${error.errorCodeName}"
+                }
+                js("window.lumenToast&&window.lumenToast(${JSONObject.quote(why)},7000)")
+                event("error")
+            }
         })
         playerView.player = p
         player = p
@@ -124,7 +146,17 @@ class MainActivity : Activity() {
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     private fun open(uri: Uri, hls: Boolean, prepared: androidx.media3.extractor.ExtractorsFactory? = null) {
         val p = ensurePlayer()
-        if (uri.scheme == "disc") {
+        if (uri.scheme == "bdnav") {
+            val b = bd ?: return
+            val factory = BdDataSource.Factory(b) { type, value -> bdEvent(type, value) }
+            val extractors = androidx.media3.extractor.DefaultExtractorsFactory()
+                .setTsExtractorFlags(androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
+                    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS)
+                .setConstantBitrateSeekingEnabled(false)
+            val source = androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(factory, extractors)
+                .createMediaSource(MediaItem.fromUri(uri))
+            p.setMediaSource(source)
+        } else if (uri.scheme == "disc") {
             // a file of a disc the app reads itself
             val factory = DiscDataSource.Factory { key, path -> discs.reader(key, path) }
             // a Blu-ray title: the length and seeking from the stream's clock (see BdavSeek)
@@ -165,7 +197,61 @@ class MainActivity : Activity() {
         } catch (_: Exception) { null }
     }
 
+    /** A disc with its menus (libbluray). Runs on a worker thread. */
+    private fun startBd(uri: Uri) {
+        val say = { msg: String -> js("window.lumenToast&&window.lumenToast(${JSONObject.quote(msg)},7000)") }
+        val fs = discs.fs(uri.host ?: "")
+        if (fs == null) { say("The disc is gone or its key is not known."); return }
+        val b = Bd()
+        if (!Bd.available()) { say("Menus are not available on this device."); return }
+        b.overlay = { plane, x, y, w, h, px -> bdDraw(plane, x, y, w, h, px) }
+        if (!b.open(fs)) { say("The disc could not be opened for its menus."); return }
+        val info = try { JSONObject(b.info()) } catch (_: Exception) { JSONObject() }
+        android.util.Log.i("LumenTV", "disc: $info")
+        if (info.optInt("hdmv") == 0 && info.optInt("bdj") > 0) {
+            say("This disc's menu is a Java program (BD-J); this app cannot run it. Its titles are listed instead.")
+            b.close(); return
+        }
+        if (info.optInt("aacs") != 0 && info.optInt("bdplus") != 0 && info.optInt("bdplusHandled") == 0)
+            say("This disc has BD+; its picture may be damaged.")
+        if (!b.play()) { say("The disc's menu could not be started."); b.close(); return }
+        bd = b
+        main.post {
+            bdOverlay.visibility = View.VISIBLE
+            open(uri, false, null)
+        }
+    }
+
+    private fun bdEvent(type: Int, value: Int) {
+        android.util.Log.i("LumenTV", "bd event $type $value")
+        when (type) {
+            Bd.EV_ENCRYPTED -> js("window.lumenToast&&window.lumenToast('This disc is encrypted and cannot be played.',7000)")
+            Bd.EV_ERROR -> js("window.lumenToast&&window.lumenToast('The disc could not be played.',7000)")
+        }
+    }
+
+    /** A plane of the menu changed. */
+    private fun bdDraw(plane: Int, x: Int, y: Int, w: Int, h: Int, px: IntArray?) {
+        if (plane !in 0..1) return
+        val bmp = synchronized(bdBitmaps) {
+            var m = bdBitmaps[plane]
+            if (m == null) { m = android.graphics.Bitmap.createBitmap(1920, 1080, android.graphics.Bitmap.Config.ARGB_8888); bdBitmaps[plane] = m }
+            if (px == null) m.eraseColor(0) else m.setPixels(px, 0, w, x, y, w, h)
+            m
+        }
+        main.post { (if (plane == 0) bdPg else bdIg).apply { setImageBitmap(bmp); invalidate() } }
+    }
+
+    private fun closeBd() {
+        val b = bd ?: return
+        bd = null
+        bdOverlay.visibility = View.GONE
+        bdBitmaps.fill(null)
+        kotlin.concurrent.thread { b.close() }
+    }
+
     private fun closePlayer() {
+        closeBd()
         main.removeCallbacks(tick)
         player?.let { it.stop(); it.clearMediaItems() }
         playerView.visibility = View.INVISIBLE
@@ -177,6 +263,29 @@ class MainActivity : Activity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val b = bd
+        if (b != null && b.opened) {
+            val vk = when (event.keyCode) {
+                KeyEvent.KEYCODE_DPAD_UP -> Bd.VK_UP
+                KeyEvent.KEYCODE_DPAD_DOWN -> Bd.VK_DOWN
+                KeyEvent.KEYCODE_DPAD_LEFT -> Bd.VK_LEFT
+                KeyEvent.KEYCODE_DPAD_RIGHT -> Bd.VK_RIGHT
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> Bd.VK_ENTER
+                KeyEvent.KEYCODE_MENU -> Bd.VK_POPUP
+                KeyEvent.KEYCODE_MEDIA_TOP_MENU, KeyEvent.KEYCODE_GUIDE -> Bd.VK_ROOT_MENU
+                KeyEvent.KEYCODE_PROG_RED -> Bd.VK_RED
+                KeyEvent.KEYCODE_PROG_GREEN -> Bd.VK_GREEN
+                KeyEvent.KEYCODE_PROG_YELLOW -> Bd.VK_YELLOW
+                KeyEvent.KEYCODE_PROG_BLUE -> Bd.VK_BLUE
+                in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> event.keyCode - KeyEvent.KEYCODE_0
+                else -> -1
+            }
+            if (vk >= 0) {
+                // the number keys: 1..9 are BD_VK_1..9 ("0" is BD_VK_0), see keys.h
+                if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) kotlin.concurrent.thread { b.key(vk) }
+                return true
+            }
+        }
         val code = when (event.keyCode) {
             KeyEvent.KEYCODE_BACK -> 27
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> 10252
@@ -226,7 +335,14 @@ class MainActivity : Activity() {
 
         @JavascriptInterface fun exit() { main.post { finish() } }
 
-        @JavascriptInterface fun play(url: String, hls: Boolean) { kotlin.concurrent.thread { val u = Uri.parse(url); val prepared = prepare(u); main.post { open(u, hls, prepared) } } }
+        @JavascriptInterface fun play(url: String, hls: Boolean) {
+            kotlin.concurrent.thread {
+                val u = Uri.parse(url)
+                if (u.scheme == "bdnav") { startBd(u); return@thread }
+                val prepared = prepare(u)
+                main.post { open(u, hls, prepared) }
+            }
+        }
         @JavascriptInterface fun resume() { main.post { player?.play() } }
         @JavascriptInterface fun pause() { main.post { player?.pause() } }
         @JavascriptInterface fun seek(ms: Double) { main.post { player?.seekTo(ms.toLong()) } }

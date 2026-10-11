@@ -71,6 +71,16 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         return r
     }
 
+    /** The disc's files for libbluray (menus), with the AACS keys if they are known. */
+    fun fs(key: String): DiscFs? {
+        val d = synchronized(open) { open[key] } ?: return null
+        val udf = d.udf ?: return null
+        if (d.encrypted && d.keys == null) return null
+        return DiscFs(udf, if (d.encrypted) d.keys?.keys else null)
+    }
+
+    fun hasMenu(key: String): Boolean = synchronized(open) { open[key] }?.kind == "Blu-ray" && Bd.available()
+
     // ---- the key database ----
     private fun keyFiles(): List<File> = listOfNotNull(
         File(activity.filesDir, "KEYDB.cfg"), activity.getExternalFilesDir(null)?.let { File(it, "KEYDB.cfg") })
@@ -217,6 +227,9 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         }
         if (rel.isEmpty() && d.kind == "Blu-ray") {
             val streams = try { udf.list("BDMV/STREAM") } catch (_: IOException) { emptyList() }
+            if (Bd.available())
+                out.put(JSONObject().put("name", "Play the disc with its menu").put("path", "disc:$key|#menu")
+                    .put("dir", false).put("uri", "bdnav://$key/").put("video", true))
             for (e in streams.filter { !it.dir && it.name.endsWith(".m2ts", true) && playable(key, "BDMV/STREAM/${it.name}") }.sortedByDescending { it.size }) {
                 out.put(JSONObject().put("name", "Title " + e.name.substringBeforeLast('.')).put("path", "disc:$key|BDMV/STREAM/${e.name}")
                     .put("dir", false).put("size", e.size).put("uri", base + "BDMV/STREAM/" + e.name).put("video", true))

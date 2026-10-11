@@ -239,6 +239,11 @@ class MkvRipper(private val readers: List<RandomReader>, private val packet: Int
         }
         if (cancelled()) throw java.io.InterruptedIOException("stopped")
         for (k in streams.keys.toList()) if (kind(streams[k]!!.es.type) == null) streams.remove(k)
+        // one picture only: a second video stream is the other view of a 3D disc or the enhancement layer
+        // of a Dolby Vision one (the base layer plays on its own, as HDR10)
+        val videoKinds = listOf("h264", "hevc", "mpeg2", "vc1")
+        val mainVideo = streams.values.firstOrNull { kind(it.es.type) in videoKinds }
+        streams.entries.removeAll { kind(it.value.es.type) in videoKinds && it.value !== mainVideo }
         if (streams.isEmpty()) throw java.io.IOException("no streams of a known kind in the title")
         val tracks = ArrayList<MkvWriter.Track>()
         var number = 0
