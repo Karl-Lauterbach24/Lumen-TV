@@ -22,6 +22,14 @@ object Aacs {
 
     class Result(val keys: List<ByteArray>, val discId: String, val title: String)
 
+    /** The disc's identity for the key database (SHA-1 of AACS/Unit_Key_RO.inf), or null. */
+    fun discId(udf: Udf): String? {
+        val inf = try { readAll(udf.open("AACS/Unit_Key_RO.inf")) } catch (_: Exception) {
+            try { readAll(udf.open("AACS/DUPLICATE/Unit_Key_RO.inf")) } catch (_: Exception) { return null }
+        }
+        return MessageDigest.getInstance("SHA-1").digest(inf).joinToString("") { "%02X".format(it) }
+    }
+
     /** The unit keys of the disc in [udf], from the first key database in [dbs] that knows it; null if none. */
     fun unlock(udf: Udf, dbs: List<File>): Result? {
         val inf = try { readAll(udf.open("AACS/Unit_Key_RO.inf")) } catch (_: Exception) {

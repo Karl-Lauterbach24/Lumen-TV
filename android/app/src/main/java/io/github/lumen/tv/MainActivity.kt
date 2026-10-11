@@ -202,7 +202,7 @@ class MainActivity : Activity() {
     private fun startBd(uri: Uri) {
         val say = { msg: String -> js("window.lumenToast&&window.lumenToast(${JSONObject.quote(msg)},7000)") }
         val fs = discs.fs(uri.host ?: "")
-        if (fs == null) { say("The disc is gone or its key is not known."); return }
+        if (fs == null) { say(discs.keyInfo(uri.host ?: "")); return }
         val b = Bd()
         if (!Bd.available()) { say("Menus are not available on this device."); return }
         b.overlay = { plane, x, y, w, h, px -> bdDraw(plane, x, y, w, h, px) }
@@ -358,6 +358,7 @@ class MainActivity : Activity() {
                 when (what) {
                     "#rip" -> discs.rip(key, say)
                     "#keys" -> discs.loadKeyDatabase(say)
+                    "#info" -> say(discs.keyInfo(key))
                     else -> discs.copy(key, say)
                 }
                 reply(id, "[]")

@@ -28,11 +28,14 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         /** The AACS keys of the disc, once the key database knows it. */
         @Volatile var keys: Aacs.Result? = null
         @Volatile var keysChecked = 0L
+        var discId: String? = null
         /** BD+ is a program on the disc that alters the stream: its presence is reported, the stream not repaired. */
         var bdplus = false
     }
 
     private val usb = activity.getSystemService(Context.USB_SERVICE) as UsbManager
+    /** The device name is a path (/dev/bus/usb/001/005); the key goes into addresses (disc://<key>/…), so no slashes. */
+    private fun usbKey(deviceName: String) = "usb" + deviceName.replace(Regex("[^A-Za-z0-9]"), "_")
     private val open = HashMap<String, Disc>()
     private val asked = HashSet<String>()
     private val action = "io.github.lumen.tv.USB_PERMISSION"
@@ -41,7 +44,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action == UsbManager.ACTION_USB_DEVICE_DETACHED) {
                 val d: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
-                synchronized(open) { open.remove("usb" + d?.deviceName)?.source?.close() }
+                synchronized(open) { open.remove(usbKey(d?.deviceName ?: ""))?.source?.close() }
             }
             changed()
         }
@@ -77,6 +80,16 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         val udf = d.udf ?: return null
         if (d.encrypted && d.keys == null) return null
         return DiscFs(udf, if (d.encrypted) d.keys?.keys else null)
+    }
+
+    /** Why a disc is not played: its AACS identity and what the key database has. */
+    fun keyInfo(key: String): String {
+        val d = synchronized(open) { open[key] } ?: return "The disc is not open any more: open it again from the list."
+        if (!d.encrypted) return "The disc is not encrypted."
+        val files = keyFiles().filter { it.isFile }
+        val entries = files.sumOf { f -> try { f.useLines(Charsets.ISO_8859_1) { l -> l.count { it.startsWith("0x") } } } catch (_: Exception) { 0 } }
+        return "AACS disc ID ${d.discId ?: "unknown"}. Key database: " +
+            (if (files.isEmpty()) "none loaded." else "$entries entries${if (d.keys != null) ", this disc is in it" else ", this disc is not in it"}.")
     }
 
     fun hasMenu(key: String): Boolean = synchronized(open) { open[key] }?.kind == "Blu-ray" && Bd.available()
@@ -182,7 +195,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
                 if (!hub) other.add(describeDevice(device))
                 continue
             }
-            val key = "usb$name"
+            val key = usbKey(name)
             present.add(key)
             val cached = synchronized(open) { open[key] }
             if (cached != null) {
@@ -273,7 +286,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         val d = Disc(key, label, kind, udf, src, encrypted, "")
         d.bdplus = udf.exists("BDSVM") || udf.exists("BDMV/BDSVM") || udf.exists("BDMV/STREAM/SSIF/BDSVM") ||
             try { udf.list("BDSVM").isNotEmpty() } catch (_: Exception) { false }
-        if (encrypted) lookupKeys(d)
+        if (encrypted) { d.discId = try { Aacs.discId(udf) } catch (_: Exception) { null }; lookupKeys(d) }
         return d
     }
 
@@ -305,6 +318,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             val have = keyFiles().any { it.isFile }
             out.put(JSONObject().put("name", if (have) "Update the key database from the net" else "Load the key database from the net")
                 .put("path", "disc:$key|#keys").put("dir", false).put("action", "keys"))
+            out.put(JSONObject().put("name", "Why? (disc ID and key database)").put("path", "disc:$key|#info").put("dir", false).put("action", "info"))
             return out
         }
         if (rel.isEmpty() && d.kind == "Blu-ray") {
