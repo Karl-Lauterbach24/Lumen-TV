@@ -29,6 +29,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         @Volatile var keys: Aacs.Result? = null
         @Volatile var keysChecked = 0L
         var discId: String? = null
+        @Volatile var lastLook = System.currentTimeMillis()
         /** AACS bus encryption: the disc asks for it / the drive can do it (null: not known) */
         var busDisc: Boolean? = null
         var busDrive: Boolean? = null
@@ -230,8 +231,12 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             val cached = synchronized(open) { open[key] }
             if (cached != null) {
                 // a disc that was taken out or changed, or a drive that had none: look again
+                val now = System.currentTimeMillis()
+                // (looked at no more often than every 8 seconds: every question wakes the drive)
+                val ask = now - cached.lastLook > 8000
+                if (ask) cached.lastLook = now
                 val stale = cached.note == "empty" || cached.note == "unreadable" ||
-                    (cached.source as? UsbBlockSource)?.mediaChanged() == true
+                    (ask && (cached.source as? UsbBlockSource)?.mediaChanged() == true)
                 if (!stale) { if (cached.encrypted) lookupKeys(cached); out.add(cached); continue }
                 synchronized(open) { open.remove(key)?.source?.close() }
             }

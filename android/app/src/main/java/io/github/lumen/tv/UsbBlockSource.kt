@@ -220,12 +220,18 @@ class UsbBlockSource private constructor(
         } catch (_: IOException) { null }
     }
 
-    /** True if the disc was taken out or changed since the last look (TEST UNIT READY + sense). */
+    /** True only if the disc was taken out or changed since the last look (unit attention, no medium): a drive that
+     *  is spinning up or has spun down is not a changed disc. */
     fun mediaChanged(): Boolean {
-        val st = try { command(cdb(0x00, 0, 0, 0, 0, 0), null, 0, 0, 5000) } catch (_: IOException) { 1 }
+        val st = try { command(cdb(0x00, 0, 0, 0, 0, 0), null, 0, 0, 5000) } catch (_: IOException) { return false }
         if (st == 0) return false
-        val (key, asc, _) = sense()
-        return asc == 0x3A || key == 6 || key == 2
+        val (key, asc, ascq) = sense()
+        if (asc == 0x3A) return true                                   // medium not present
+        if (key == 6) return true                                      // unit attention: new medium / reset
+        if (key == 2 && asc == 0x04 && ascq == 0x02) {                 // spun down: start it, nothing changed
+            try { command(cdb(0x1B, 1, 0, 0, 1, 0), null, 0, 0, 30000) } catch (_: IOException) { }
+        }
+        return false
     }
 
     fun readCapacity(): Boolean {
