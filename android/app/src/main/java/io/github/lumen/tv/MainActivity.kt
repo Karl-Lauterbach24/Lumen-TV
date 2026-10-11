@@ -47,6 +47,7 @@ class MainActivity : Activity() {
     private var pageReady = false
     private var bd: Bd? = null
     private var bdFs: DiscFs? = null
+    private var bdKey = ""
     private lateinit var bdOverlay: android.view.View
     private lateinit var bdPg: android.widget.ImageView
     private lateinit var bdIg: android.widget.ImageView
@@ -112,7 +113,7 @@ class MainActivity : Activity() {
                 while (cause?.cause != null && cause.cause !== cause) cause = cause.cause
                 val failed = bdFs?.failedUnits() ?: 0
                 val why = when {
-                    failed > 20 -> "The disc's stream could not be decrypted ($failed units): its key is wrong or the disc uses a protection this app cannot handle (AACS 2.0, BD+)."
+                    failed > 20 -> "The disc's stream could not be decrypted ($failed units). " + discs.keyInfo(bdKey)
                     error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES ||
                     error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ||
                     error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ->
@@ -217,6 +218,7 @@ class MainActivity : Activity() {
         val b = Bd()
         if (!Bd.available()) { say("Menus are not available on this device."); return }
         bdFs = fs
+        bdKey = uri.host ?: ""
         b.overlay = { plane, x, y, w, h, px -> bdDraw(plane, x, y, w, h, px) }
         if (!b.open(fs)) { say("The disc could not be opened for its menus."); return }
         val info = try { JSONObject(b.info()) } catch (_: Exception) { JSONObject() }

@@ -142,6 +142,17 @@ class UsbBlockSource private constructor(
         return false
     }
 
+    /** (AACS active, bus encryption supported) from the drive's AACS feature (GET CONFIGURATION 0x010d), or null. */
+    fun aacsFeature(): Pair<Boolean, Boolean>? {
+        val b = ByteArray(16)
+        val c = cdb(0x46, 0x01, 0x01, 0x0d, 0, 0, 0, 0, 16, 0)
+        return try {
+            if (command(c, b, 0, 16, 5000) != 0) return null
+            if ((((b[8].toInt() and 0xff) shl 8) or (b[9].toInt() and 0xff)) != 0x010d) return null
+            Pair((b[2 + 8].toInt() and 1) != 0, (b[4 + 8].toInt() and 2) != 0)
+        } catch (_: IOException) { null }
+    }
+
     /** True if the disc was taken out or changed since the last look (TEST UNIT READY + sense). */
     fun mediaChanged(): Boolean {
         val st = try { command(cdb(0x00, 0, 0, 0, 0, 0), null, 0, 0, 5000) } catch (_: IOException) { 1 }

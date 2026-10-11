@@ -29,6 +29,9 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         @Volatile var keys: Aacs.Result? = null
         @Volatile var keysChecked = 0L
         var discId: String? = null
+        /** AACS bus encryption: the disc asks for it / the drive can do it (null: not known) */
+        var busDisc: Boolean? = null
+        var busDrive: Boolean? = null
         /** BD+ is a program on the disc that alters the stream: its presence is reported, the stream not repaired. */
         var bdplus = false
     }
@@ -88,8 +91,15 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         if (!d.encrypted) return "The disc is not encrypted."
         val files = keyFiles().filter { it.isFile }
         val entries = files.sumOf { f -> try { f.useLines(Charsets.ISO_8859_1) { l -> l.count { it.startsWith("0x") } } } catch (_: Exception) { 0 } }
+        val bus = when {
+            d.busDisc == true && d.busDrive == true ->
+                " Bus encryption: the disc asks for it and the drive does it – the drive then scrambles the data on the cable unless it is unlocked (LibreDrive firmware) or the app can authenticate with a certificate the drive has not revoked."
+            d.busDisc == true && d.busDrive == false -> " Bus encryption: the disc asks for it, the drive does not do it."
+            d.busDisc == false -> " Bus encryption: not used by this disc."
+            else -> ""
+        }
         return "AACS disc ID ${d.discId ?: "unknown"}. Key database: " +
-            (if (files.isEmpty()) "none loaded." else "$entries entries${if (d.keys != null) ", this disc is in it" else ", this disc is not in it"}.")
+            (if (files.isEmpty()) "none loaded." else "$entries entries${if (d.keys != null) ", this disc is in it" else ", this disc is not in it"}.") + bus
     }
 
     fun hasMenu(key: String): Boolean = synchronized(open) { open[key] }?.kind == "Blu-ray" && Bd.available()
@@ -286,7 +296,15 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         val d = Disc(key, label, kind, udf, src, encrypted, "")
         d.bdplus = udf.exists("BDSVM") || udf.exists("BDMV/BDSVM") || udf.exists("BDMV/STREAM/SSIF/BDSVM") ||
             try { udf.list("BDSVM").isNotEmpty() } catch (_: Exception) { false }
-        if (encrypted) { d.discId = try { Aacs.discId(udf) } catch (_: Exception) { null }; lookupKeys(d) }
+        if (encrypted) {
+            d.discId = try { Aacs.discId(udf) } catch (_: Exception) { null }
+            d.busDisc = try {
+                val r = try { udf.open("AACS/Content000.cer") } catch (_: Exception) { udf.open("AACS/Content001.cer") }
+                val b = ByteArray(2); r.read(0, b, 0, 2); (b[1].toInt() and 0x80) != 0
+            } catch (_: Exception) { null }
+            d.busDrive = (src as? UsbBlockSource)?.aacsFeature()?.second
+            lookupKeys(d)
+        }
         return d
     }
 
@@ -332,6 +350,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             }
             out.put(JSONObject().put("name", "Copy the titles to storage").put("path", "disc:$key|#copy").put("dir", false).put("action", "copy"))
             out.put(JSONObject().put("name", "Make MKV files of the titles").put("path", "disc:$key|#rip").put("dir", false).put("action", "rip"))
+            if (d.encrypted) out.put(JSONObject().put("name", "Protection of this disc (AACS)").put("path", "disc:$key|#info").put("dir", false).put("action", "info"))
             return out
         }
         if (rel.isEmpty() && d.kind == "DVD-Video") {
