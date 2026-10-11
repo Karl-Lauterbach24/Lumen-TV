@@ -372,7 +372,7 @@ class MainActivity : Activity() {
                 when (what) {
                     "#rip" -> discs.rip(key, say)
                     "#keys" -> discs.loadKeyDatabase(say)
-                    "#info" -> say(discs.keyInfo(key))
+                    "#info" -> say(discs.keyInfo(key, true))
                     else -> discs.copy(key, say)
                 }
                 reply(id, "[]")

@@ -112,7 +112,7 @@ object Aacs {
     }
 
     /** Decrypts one aligned unit in place; false if no key makes it a transport stream. */
-    class Unit(private val keys: List<ByteArray>) {
+    class Unit(private val keys: List<ByteArray>, private val busKey: ByteArray? = null) {
         private var current = 0
         private val ecb = Cipher.getInstance("AES/ECB/NoPadding")
         private val cbc = Cipher.getInstance("AES/CBC/NoPadding")
@@ -121,6 +121,16 @@ object Aacs {
 
         fun decrypt(buf: ByteArray, off: Int): Boolean {
             if (buf[off].toInt() and 0xc0 == 0) return true          // copy permission indicator 0: not encrypted
+            if (busKey != null) {
+                // the drive scrambled every sector of the unit with the read data key (bytes 16.. of each 2048)
+                val bus = Cipher.getInstance("AES/CBC/NoPadding")
+                var s = 0
+                while (s < 6144) {
+                    bus.init(Cipher.DECRYPT_MODE, SecretKeySpec(busKey, "AES"), IvParameterSpec(IV))
+                    bus.doFinal(buf, off + s + 16, 2032, buf, off + s + 16)
+                    s += 2048
+                }
+            }
             for (n in keys.indices) {
                 val k = (current + n) % keys.size
                 System.arraycopy(buf, off, seed, 0, 16)
@@ -147,9 +157,9 @@ object Aacs {
 }
 
 /** The plain stream of an AACS-encrypted file: aligned units decrypted as they are read. */
-class AacsReader(private val inner: RandomReader, keys: List<ByteArray>) : RandomReader {
+class AacsReader(private val inner: RandomReader, keys: List<ByteArray>, busKey: ByteArray? = null) : RandomReader {
     override val size: Long get() = inner.size
-    private val unit = Aacs.Unit(keys)
+    private val unit = Aacs.Unit(keys, busKey)
     private val chunk = ByteArray(6144 * 64)
     private var chunkAt = -1L
     private var chunkLen = 0

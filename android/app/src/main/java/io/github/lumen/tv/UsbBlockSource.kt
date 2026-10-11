@@ -17,7 +17,7 @@ class UsbBlockSource private constructor(
     private val iface: UsbInterface,
     private val bulkIn: UsbEndpoint,
     private val bulkOut: UsbEndpoint,
-) : BlockSource {
+) : BlockSource, Scsi {
     override var sectors: Long = 0
         private set
     var vendor = ""
@@ -71,7 +71,35 @@ class UsbBlockSource private constructor(
     }
 
     /** Sends one command; data (if any) is received into [data]. Returns the CSW status (0 = good). */
-    private fun command(cdb: ByteArray, data: ByteArray?, offset: Int, length: Int, timeout: Int = 20000): Int {
+    /** Sends [data] to the drive with [cdb] (SEND KEY and the like); returns the CSW status (0 = good). */
+    @Synchronized override fun commandOut(cdb: ByteArray, data: ByteArray, timeout: Int): Int {
+        val t = tag++
+        cbw.fill(0)
+        cbw[0] = 'U'.code.toByte(); cbw[1] = 'S'.code.toByte(); cbw[2] = 'B'.code.toByte(); cbw[3] = 'C'.code.toByte()
+        putLe(cbw, 4, t); putLe(cbw, 8, data.size)
+        cbw[12] = 0
+        cbw[14] = cdb.size.toByte()
+        System.arraycopy(cdb, 0, cbw, 15, cdb.size)
+        if (connection.bulkTransfer(bulkOut, cbw, 31, 5000) != 31) { reset(); throw IOException("command not sent") }
+        var sent = 0
+        while (sent < data.size) {
+            val n = connection.bulkTransfer(bulkOut, data, sent, minOf(CHUNK, data.size - sent), timeout)
+            if (n <= 0) { clearHalt(bulkOut); break }
+            sent += n
+        }
+        var n = connection.bulkTransfer(bulkIn, csw, 13, 5000)
+        if (n != 13) { clearHalt(bulkIn); n = connection.bulkTransfer(bulkIn, csw, 13, 5000) }
+        if (n != 13 || csw[0] != 'U'.code.toByte() || getLe(csw, 4) != t) { reset(); throw IOException("bad status from the drive") }
+        return csw[12].toInt() and 0xff
+    }
+
+    /** Reads [length] bytes with [cdb] (REPORT KEY, READ DISC STRUCTURE …); null if the drive says no. */
+    override fun commandIn(cdb: ByteArray, length: Int, timeout: Int): ByteArray? {
+        val b = ByteArray(length)
+        return try { if (command(cdb, b, 0, length, timeout) == 0) b else null } catch (_: IOException) { null }
+    }
+
+    @Synchronized private fun command(cdb: ByteArray, data: ByteArray?, offset: Int, length: Int, timeout: Int = 20000): Int {
         val t = tag++
         cbw.fill(0)
         cbw[0] = 'U'.code.toByte(); cbw[1] = 'S'.code.toByte(); cbw[2] = 'B'.code.toByte(); cbw[3] = 'C'.code.toByte()

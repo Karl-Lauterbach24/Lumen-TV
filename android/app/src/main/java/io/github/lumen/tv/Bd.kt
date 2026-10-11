@@ -110,7 +110,7 @@ class Bd {
 }
 
 /** The files of a disc for libbluray; streams of an AACS disc are decrypted as they are read. */
-class DiscFs(private val udf: Udf, private val keys: List<ByteArray>?) : Bd.Fs {
+class DiscFs(private val udf: Udf, private val keys: List<ByteArray>?, private val busKey: ByteArray? = null) : Bd.Fs {
     private val files = HashMap<Int, RandomReader>()
     private val streams = ArrayList<AacsReader>()
     /** Units of the streams that no key could decrypt (a wrong or missing key, AACS 2, BD+ …). */
@@ -122,7 +122,7 @@ class DiscFs(private val udf: Udf, private val keys: List<ByteArray>?) : Bd.Fs {
         return try {
             val p = path.trimStart('/')
             var r: RandomReader = udf.open(p)
-            if (keys != null && p.startsWith("BDMV/STREAM/", true) && p.endsWith(".m2ts", true)) { val ar = AacsReader(r, keys); streams.add(ar); r = ar }
+            if (keys != null && p.startsWith("BDMV/STREAM/", true) && p.endsWith(".m2ts", true)) { val ar = AacsReader(r, keys, busKey); streams.add(ar); r = ar }
             val h = next++
             files[h] = r
             h

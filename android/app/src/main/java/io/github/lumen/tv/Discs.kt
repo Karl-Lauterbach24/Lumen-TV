@@ -32,6 +32,9 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         /** AACS bus encryption: the disc asks for it / the drive can do it (null: not known) */
         var busDisc: Boolean? = null
         var busDrive: Boolean? = null
+        /** the drive's read data key (bus decryption) and what happened when it was asked for */
+        @Volatile var busKey: ByteArray? = null
+        @Volatile var busStatus: String? = null
         /** BD+ is a program on the disc that alters the stream: its presence is reported, the stream not repaired. */
         var bdplus = false
     }
@@ -73,8 +76,22 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         val d = synchronized(open) { open[key] } ?: return null
         val r = d.udf?.open(path) ?: return null
         val keys = d.keys
-        if (d.encrypted && keys != null && path.startsWith("BDMV/STREAM/", true)) return AacsReader(r, keys.keys)
+        if (d.encrypted && keys != null && path.startsWith("BDMV/STREAM/", true)) { ensureBus(d); return AacsReader(r, keys.keys, d.busKey) }
         return r
+    }
+
+    /** A disc that asks for bus encryption on a drive that does it: authenticate to the drive once (needs a host certificate). */
+    @Synchronized private fun ensureBus(d: Disc) {
+        if (d.busKey != null || d.busStatus != null) return
+        if (d.busDisc != true || d.busDrive == false) return
+        val usbSrc = d.source as? UsbBlockSource ?: return
+        // the user's own certificates first (hostcerts.cfg in the app's folder is never overwritten by an update of the database)
+        val own = listOfNotNull(File(activity.filesDir, "hostcerts.cfg"), activity.getExternalFilesDir(null)?.let { File(it, "hostcerts.cfg") })
+        val certs = AacsDrive.hostCerts(own + keyFiles())
+        val r = AacsDrive.readDataKey(usbSrc, certs) { android.util.Log.i("LumenTV", "AACS: $it") }
+        d.busKey = r.readDataKey
+        d.busStatus = r.message
+        android.util.Log.i("LumenTV", "AACS drive authentication: ${r.message}")
     }
 
     /** The disc's files for libbluray (menus), with the AACS keys if they are known. */
@@ -82,18 +99,21 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         val d = synchronized(open) { open[key] } ?: return null
         val udf = d.udf ?: return null
         if (d.encrypted && d.keys == null) return null
-        return DiscFs(udf, if (d.encrypted) d.keys?.keys else null)
+        if (d.encrypted) ensureBus(d)
+        return DiscFs(udf, if (d.encrypted) d.keys?.keys else null, d.busKey)
     }
 
     /** Why a disc is not played: its AACS identity and what the key database has. */
-    fun keyInfo(key: String): String {
+    fun keyInfo(key: String, authenticate: Boolean = false): String {
         val d = synchronized(open) { open[key] } ?: return "The disc is not open any more: open it again from the list."
         if (!d.encrypted) return "The disc is not encrypted."
+        if (authenticate && d.keys != null) ensureBus(d)
         val files = keyFiles().filter { it.isFile }
         val entries = files.sumOf { f -> try { f.useLines(Charsets.ISO_8859_1) { l -> l.count { it.startsWith("0x") } } } catch (_: Exception) { 0 } }
         val bus = when {
             d.busDisc == true && d.busDrive == true ->
-                " Bus encryption: the disc asks for it and the drive does it – the drive then scrambles the data on the cable unless it is unlocked (LibreDrive firmware) or the app can authenticate with a certificate the drive has not revoked."
+                " Bus encryption: the disc asks for it and the drive does it. Authentication with the drive: " +
+                (d.busKey != null || d.busStatus != null).let { if (it) (d.busStatus ?: "ok") else "not tried yet" } + "."
             d.busDisc == true && d.busDrive == false -> " Bus encryption: the disc asks for it, the drive does not do it."
             d.busDisc == false -> " Bus encryption: not used by this disc."
             else -> ""
