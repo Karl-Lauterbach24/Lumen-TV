@@ -65,13 +65,19 @@ object AacsDrive {
             val r = authenticate(usb, c, log)
             if (r.readDataKey != null) return r
             last = r.message
+            if (last.startsWith("step 1/6") || last.startsWith("step 3/6") || last.startsWith("step 4/6") ||
+                last.startsWith("step 6/6")) break
         }
         return Outcome(null, last)
     }
 
     fun authenticate(usb: Scsi, c: HostCert, log: (String) -> Unit = {}): Outcome {
-        for (a in 0 until 4) invalidate(usb, a)
-        val agidBuf = reportKey(usb, 0, 0, 8) ?: return Outcome(null, "step 1/6 AGID: the drive gave none (${usb.lastSense})")
+        var agidBuf = reportKey(usb, 0, 0, 8)
+        if (agidBuf == null) {                                // maybe a session is left open: close them all and ask again
+            for (a in 0 until 4) invalidate(usb, a)
+            agidBuf = reportKey(usb, 0, 0, 8)
+        }
+        if (agidBuf == null) return Outcome(null, "step 1/6 AGID: the drive gave none (${usb.lastSense})")
         val agid = (agidBuf[7].toInt() and 0xff) ushr 6
         try {
             val hn = AacsEc.nonce()

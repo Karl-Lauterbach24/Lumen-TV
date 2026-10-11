@@ -124,19 +124,44 @@ class UsbBlockSource private constructor(
         System.arraycopy(cdb, 0, cbw, 15, cdb.size)
         if (connection.bulkTransfer(bulkOut, cbw, 31, 5000) != 31) { reset(); throw IOException("command not sent") }
         var got = 0
+        var cswRead = false
         if (length > 0 && data != null) {
+            val mps = maxOf(64, bulkIn.maxPacketSize)
+            val small = ByteArray(maxOf(mps, 512))
             while (got < length) {
-                val n = connection.bulkTransfer(bulkIn, data, offset + got, minOf(CHUNK, length - got), timeout)
-                if (n < 0) { clearHalt(bulkIn); break }
-                if (n == 0) break
-                got += n
+                val want = minOf(CHUNK, length - got)
+                if (want >= mps) {
+                    val n = connection.bulkTransfer(bulkIn, data, offset + got, want, timeout)
+                    if (n < 0) { clearHalt(bulkIn); break }
+                    if (n == 0) break
+                    got += n
+                    if (n < want && n % mps != 0) break              // a short packet ends the data phase
+                } else {
+                    // a short transfer: read a whole packet's worth, so a drive that sends its status instead of data
+                    // (a command that moves nothing, or fails) does not overflow the buffer and get lost
+                    val n = connection.bulkTransfer(bulkIn, small, mps, timeout)
+                    if (n < 0) { clearHalt(bulkIn); break }
+                    if (n == 0) break
+                    if (n == 13 && small[0] == 'U'.code.toByte() && small[1] == 'S'.code.toByte() && small[2] == 'B'.code.toByte() &&
+                        small[3] == 'S'.code.toByte() && getLe(small, 4) == t) {
+                        System.arraycopy(small, 0, csw, 0, 13); cswRead = true
+                        break
+                    }
+                    val c = minOf(n, want)
+                    System.arraycopy(small, 0, data, offset + got, c)
+                    got += c
+                    break
+                }
             }
         }
-        var n = connection.bulkTransfer(bulkIn, csw, 13, 5000)
-        if (n != 13) { clearHalt(bulkIn); n = connection.bulkTransfer(bulkIn, csw, 13, 5000) }
+        var n = 13
+        if (!cswRead) {
+            n = connection.bulkTransfer(bulkIn, csw, 13, 5000)
+            if (n != 13) { clearHalt(bulkIn); n = connection.bulkTransfer(bulkIn, csw, 13, 5000) }
+        }
         if (n != 13 || csw[0] != 'U'.code.toByte() || csw[1] != 'S'.code.toByte() || getLe(csw, 4) != t) { reset(); throw IOException("bad status from the drive") }
         val status = csw[12].toInt() and 0xff
-        if (status == 0 && got < length) throw IOException("short read ($got of $length)")
+        if (status == 0 && got < length && !(cswRead && got == 0 && length <= 36)) throw IOException("short read ($got of $length)")
         return status
     }
 
