@@ -46,6 +46,7 @@ class MainActivity : Activity() {
     private lateinit var discs: Discs
     private var pageReady = false
     private var bd: Bd? = null
+    private var bdFs: DiscFs? = null
     private lateinit var bdOverlay: android.view.View
     private lateinit var bdPg: android.widget.ImageView
     private lateinit var bdIg: android.widget.ImageView
@@ -105,16 +106,26 @@ class MainActivity : Activity() {
             }
             override fun onIsPlayingChanged(isPlaying: Boolean) { event(if (isPlaying) "playing" else "pause") }
             override fun onPlayerError(error: PlaybackException) {
-                val why = when (error.errorCode) {
-                    PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES,
-                    PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED,
-                    PlaybackException.ERROR_CODE_DECODER_INIT_FAILED -> "This television cannot decode this video (its format or resolution)."
-                    PlaybackException.ERROR_CODE_IO_UNSPECIFIED, PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND ->
-                        "The disc or file could not be read."
-                    else -> "Playback stopped: ${error.errorCodeName}"
+                val fmt = (error as? androidx.media3.exoplayer.ExoPlaybackException)?.rendererFormat
+                val what = if (fmt != null) " (${fmt.sampleMimeType} ${fmt.width}x${fmt.height})" else ""
+                var cause: Throwable? = error.cause
+                while (cause?.cause != null && cause.cause !== cause) cause = cause.cause
+                val failed = bdFs?.failedUnits() ?: 0
+                val why = when {
+                    failed > 20 -> "The disc's stream could not be decrypted ($failed units): its key is wrong or the disc uses a protection this app cannot handle (AACS 2.0, BD+)."
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES ||
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ->
+                        "This television cannot decode this video$what: ${error.errorCodeName}."
+                    error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED ->
+                        "The stream of the disc could not be read (${error.errorCodeName}${cause?.message?.let { ": $it" } ?: ""})."
+                    else -> "Playback stopped: ${error.errorCodeName}${cause?.message?.let { " – $it" } ?: ""}$what"
                 }
-                js("window.lumenToast&&window.lumenToast(${JSONObject.quote(why)},7000)")
+                android.util.Log.w("LumenTV", "player error: $why / $error")
                 event("error")
+                // (after the page's own "does not play" message, which it shows at once)
+                main.postDelayed({ js("window.lumenToast&&window.lumenToast(${JSONObject.quote(why)},20000)") }, 500)
             }
         })
         playerView.player = p
@@ -205,6 +216,7 @@ class MainActivity : Activity() {
         if (fs == null) { say(discs.keyInfo(uri.host ?: "")); return }
         val b = Bd()
         if (!Bd.available()) { say("Menus are not available on this device."); return }
+        bdFs = fs
         b.overlay = { plane, x, y, w, h, px -> bdDraw(plane, x, y, w, h, px) }
         if (!b.open(fs)) { say("The disc could not be opened for its menus."); return }
         val info = try { JSONObject(b.info()) } catch (_: Exception) { JSONObject() }
