@@ -155,7 +155,8 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             if (iface == null) {
                 // hubs, keyboards, ... are not interesting; storage and unknown things are shown, so one can see what arrives
                 val classes = (0 until device.interfaceCount).map { device.getInterface(it).interfaceClass }
-                if (device.deviceClass != 9 && classes.any { it == 8 || it == 255 || it == 0 }) other.add(describeDevice(device))
+                val hub = device.deviceClass == 9 && classes.all { it == 9 }
+                if (!hub) other.add(describeDevice(device))
                 continue
             }
             val key = "usb$name"
@@ -194,6 +195,11 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
                     changed()
                 }
             }
+        }
+        if (usb.deviceList.isEmpty()) {
+            other.add(if (!activity.packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_USB_HOST))
+                "This television does not offer USB host access to apps (no USB device is visible)"
+                else "No USB device is visible to apps (check the cable and the drive's power)")
         }
         unsupported = other
         synchronized(open) {
@@ -260,7 +266,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             }
             a.put(JSONObject().put("name", d.label).put("path", "disc:${d.key}|").put("detail", detail))
         }
-        for (u in unsupported) a.put(JSONObject().put("name", u).put("path", "").put("detail", "not usable").put("off", true))
+        for (u in unsupported) a.put(JSONObject().put("name", u).put("path", "").put("detail", "USB device, not usable").put("off", true))
         return a
     }
 

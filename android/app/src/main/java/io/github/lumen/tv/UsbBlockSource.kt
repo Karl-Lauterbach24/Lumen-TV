@@ -54,6 +54,8 @@ class UsbBlockSource private constructor(
             }
             if (inEp == null || outEp == null) return null
             if (!connection.claimInterface(iface, true)) return null
+            // a UAS bridge sits in its other alternate setting while the system's driver has it: select the bulk-only one
+            try { connection.setInterface(iface) } catch (_: Exception) { }
             return UsbBlockSource(connection, iface, inEp, outEp)
         }
     }
