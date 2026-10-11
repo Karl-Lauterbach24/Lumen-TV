@@ -90,13 +90,27 @@ class UsbBlockSource private constructor(
         var n = connection.bulkTransfer(bulkIn, csw, 13, 5000)
         if (n != 13) { clearHalt(bulkIn); n = connection.bulkTransfer(bulkIn, csw, 13, 5000) }
         if (n != 13 || csw[0] != 'U'.code.toByte() || getLe(csw, 4) != t) { reset(); throw IOException("bad status from the drive") }
-        return csw[12].toInt() and 0xff
+        val st = csw[12].toInt() and 0xff
+        lastSense = if (st != 0) "status $st, " + senseText() else ""
+        return st
     }
 
     /** Reads [length] bytes with [cdb] (REPORT KEY, READ DISC STRUCTURE …); null if the drive says no. */
+    @Volatile override var lastSense: String = ""
+        private set
+
+    private fun senseText(): String {
+        val (k, asc, q) = sense()
+        return "sense %X/%02X/%02X".format(k, asc, q)
+    }
+
     override fun commandIn(cdb: ByteArray, length: Int, timeout: Int): ByteArray? {
         val b = ByteArray(length)
-        return try { if (command(cdb, b, 0, length, timeout) == 0) b else null } catch (_: IOException) { null }
+        lastSense = ""
+        return try {
+            val st = command(cdb, b, 0, length, timeout)
+            if (st == 0) b else { lastSense = "status $st, " + senseText(); null }
+        } catch (e: IOException) { lastSense = "transfer error: ${e.message}"; null }
     }
 
     @Synchronized private fun command(cdb: ByteArray, data: ByteArray?, offset: Int, length: Int, timeout: Int = 20000): Int {

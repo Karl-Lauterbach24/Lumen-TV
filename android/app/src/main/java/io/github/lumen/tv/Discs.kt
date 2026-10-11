@@ -112,13 +112,13 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         val entries = files.sumOf { f -> try { f.useLines(Charsets.ISO_8859_1) { l -> l.count { it.startsWith("0x") } } } catch (_: Exception) { 0 } }
         val bus = when {
             d.busDisc == true && d.busDrive == true ->
-                " Bus encryption: the disc asks for it and the drive does it. Authentication with the drive: " +
-                (d.busKey != null || d.busStatus != null).let { if (it) (d.busStatus ?: "ok") else "not tried yet" } + "."
+                " Bus encryption: the disc asks for it and the drive does it."
             d.busDisc == true && d.busDrive == false -> " Bus encryption: the disc asks for it, the drive does not do it."
             d.busDisc == false -> " Bus encryption: not used by this disc."
             else -> ""
         }
-        return "AACS disc ID ${d.discId ?: "unknown"}. Key database: " +
+        val auth = if (d.busDisc == true && d.busDrive != false) "Drive authentication: " + (d.busStatus ?: "not tried") + ". " else ""
+        return auth + "AACS disc ID ${d.discId ?: "unknown"}. Key database: " +
             (if (files.isEmpty()) "none loaded." else "$entries entries${if (d.keys != null) ", this disc is in it" else ", this disc is not in it"}.") + bus
     }
 
