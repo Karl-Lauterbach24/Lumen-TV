@@ -140,6 +140,29 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         return "${device.productName ?: device.manufacturerName ?: "USB device"} ($vp, interfaces $ifs)"
     }
 
+    /** What the kernel says about USB (when the system lets an app read /sys): helps when Android's own list is empty. */
+    private fun kernelUsb(): List<String> {
+        val out = ArrayList<String>()
+        fun rd(f: File): String = try { f.readText().trim() } catch (_: Exception) { "" }
+        try {
+            val root = File("/sys/bus/usb/devices")
+            val devs = root.listFiles().orEmpty().filter { Regex("\\d+-[\\d.]+").matches(it.name) }.sortedBy { it.name }
+            for (dev in devs) {
+                val ifs = dev.listFiles().orEmpty().filter { it.name.startsWith(dev.name + ":") }.sortedBy { it.name }
+                    .joinToString(" ") { rd(File(it, "bInterfaceClass")) + "/" + rd(File(it, "bInterfaceSubClass")) + "/" + rd(File(it, "bInterfaceProtocol")) + (rd(File(it, "driver")).ifEmpty { "" }) }
+                val name = rd(File(dev, "product")).ifEmpty { rd(File(dev, "manufacturer")) }.ifEmpty { "USB device" }
+                out.add("kernel: $name (${rd(File(dev, "idVendor"))}:${rd(File(dev, "idProduct"))}, ${rd(File(dev, "speed"))} Mb/s, interfaces $ifs)")
+            }
+            if (devs.isEmpty() && root.exists()) out.add("kernel: no USB device on any port")
+            if (!root.exists() || root.listFiles() == null) out.add("kernel: the list of USB devices cannot be read by apps on this television")
+        } catch (e: Exception) { out.add("kernel: USB list failed: $e") }
+        try {
+            val blocks = File("/sys/block").list().orEmpty().filter { it.startsWith("sd") || it.startsWith("sr") || it.startsWith("sg") }
+            if (blocks.isNotEmpty()) out.add("kernel: block devices " + blocks.sorted().joinToString(" "))
+        } catch (_: Exception) { }
+        return out
+    }
+
     /** All discs now present. Never waits for a drive: a drive that is still being read is listed as "reading". */
     fun refresh(): List<Disc> {
         if (!refreshLock.tryLock()) return last
@@ -201,6 +224,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
                 "This television does not offer USB host access to apps (no USB device is visible)"
                 else "No USB device is visible to apps (check the cable and the drive's power)")
         }
+        other.addAll(kernelUsb())
         unsupported = other
         synchronized(open) {
             val gone = open.keys.filter { it.startsWith("usb") && it !in present }
@@ -266,7 +290,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             }
             a.put(JSONObject().put("name", d.label).put("path", "disc:${d.key}|").put("detail", detail))
         }
-        for (u in unsupported) a.put(JSONObject().put("name", u).put("path", "").put("detail", "USB device, not usable").put("off", true))
+        for (u in unsupported) a.put(JSONObject().put("name", u).put("path", "").put("detail", "").put("off", true))
         return a
     }
 
