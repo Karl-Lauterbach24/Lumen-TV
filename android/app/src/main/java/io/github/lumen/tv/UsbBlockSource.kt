@@ -139,6 +139,14 @@ class UsbBlockSource private constructor(
         return false
     }
 
+    /** True if the disc was taken out or changed since the last look (TEST UNIT READY + sense). */
+    fun mediaChanged(): Boolean {
+        val st = try { command(cdb(0x00, 0, 0, 0, 0, 0), null, 0, 0, 5000) } catch (_: IOException) { 1 }
+        if (st == 0) return false
+        val (key, asc, _) = sense()
+        return asc == 0x3A || key == 6 || key == 2
+    }
+
     fun readCapacity(): Boolean {
         val b = ByteArray(8)
         if (command(cdb(0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0), b, 0, 8, 10000) != 0) return false

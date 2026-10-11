@@ -134,7 +134,14 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             val key = "usb$name"
             present.add(key)
             val cached = synchronized(open) { open[key] }
-            if (cached != null) { if (cached.encrypted) lookupKeys(cached); out.add(cached); continue }
+            if (cached != null) {
+                // a disc that was taken out or changed, or a drive that had none: look again
+                val stale = cached.note == "empty" || cached.note == "unreadable" ||
+                    (cached.source as? UsbBlockSource)?.mediaChanged() == true
+                if (!stale) { if (cached.encrypted) lookupKeys(cached); out.add(cached); continue }
+                synchronized(open) { open.remove(key)?.source?.close() }
+                // (the connection is reopened below)
+            }
             if (!usb.hasPermission(device)) {
                 if (asked.add(key)) {
                     val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
