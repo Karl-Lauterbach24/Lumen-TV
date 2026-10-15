@@ -38,8 +38,18 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
 
     companion object { var READ_BUFFER_MB = 16 }
 
-    class Title(val id: Int, val name: String, val durationMs: Long, val size: String, val file: String) {
+    class Title(val id: Int, val name: String, val durationMs: Long, val size: String, val file: String, val chapters: Int = 0) {
         override fun toString() = "#$id $name ${durationMs / 60000} min $size"
+        val minutes get() = (durationMs / 60000).toInt()
+    }
+
+    /** What the disc is, from its titles and name. [main]: the film, or the episodes in order; [all]: a "play all" title. */
+    class Disc(val name: String, val kind: String, val season: Int, val discNo: Int,
+               val main: List<Title>, val all: Title?, val extras: List<Title>) {
+        /** "Doctor Who · Season 1 · Disc 3" */
+        fun label(de: Boolean): String = listOfNotNull(name.ifEmpty { null },
+            if (season > 0) (if (de) "Staffel $season" else "Season $season") else null,
+            if (discNo > 0) "Disc $discNo" else null).joinToString(" · ")
     }
 
     // ---------------------------------------------------------------- the Linux tree
@@ -398,13 +408,55 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         }
     }
 
+    /** MakeMKV's CINFO of the last disc read: 2 = name, 32 = volume name. */
+    val discInfo = HashMap<Int, String>()
+
+    /**
+     * Film or episodes? Episodes: two or more titles of 15–75 minutes of similar length (within a third of each
+     * other); a longer title that is about their sum is the "play all". A film: the longest title otherwise.
+     * Short titles are extras.
+     */
+    fun identify(titles: List<Title>): Disc {
+        val volume = discInfo[32].orEmpty()
+        val raw = (discInfo[2]?.takeIf { it.isNotBlank() } ?: volume).replace('_', ' ').trim()
+        val season = Regex("""(?i)(?:\bST|\bS|season|staffel|series)\s*0*(\d{1,2})\b""").find(raw)?.groupValues?.get(1)?.toInt() ?: 0
+        val discNo = Regex("""(?i)(?:\bBD|\bdisc|\bdisk|\bD)\s*0*(\d{1,2})\b""").find(raw)?.groupValues?.get(1)?.toInt() ?: 0
+        // the name without season / disc markers: "Doctor Who - Staffel 1 - Disc 3" -> "Doctor Who"
+        val name = raw.replace(Regex("""(?i)[-–\s]*(?:\bST|\bS|season|staffel|series|\bBD|\bdisc|\bdisk)\s*0*\d{1,2}\b.*$"""), "").trim(' ', '-', '–')
+            .split(' ').joinToString(" ") { w -> if (w.length >= 3 && w == w.uppercase()) w.lowercase().replaceFirstChar { it.uppercase() } else w }
+        val real = titles.filter { it.minutes >= 1 }
+        val eps = real.filter { it.minutes in 15..75 }
+        var group: List<Title> = emptyList()
+        if (eps.size >= 2) {
+            // the largest set of similar lengths
+            val sorted = eps.sortedBy { it.durationMs }
+            var best = emptyList<Title>()
+            for (i in sorted.indices) {
+                val set = sorted.filter { it.durationMs >= sorted[i].durationMs && it.durationMs <= sorted[i].durationMs * 4 / 3 }
+                if (set.size > best.size) best = set
+            }
+            if (best.size >= 2) group = best.sortedBy { it.id }
+        }
+        if (group.isNotEmpty()) {
+            val sum = group.sumOf { it.durationMs }
+            val all = real.firstOrNull { it !in group && it.durationMs >= sum * 92 / 100 && it.durationMs <= sum * 108 / 100 }
+            val extras = real.filter { it !in group && it != all && it.minutes >= 2 }.sortedByDescending { it.durationMs }
+            return Disc(name, "episodes", season, discNo, group, all, extras)
+        }
+        val film = real.maxByOrNull { it.durationMs }
+        val extras = real.filter { it != film && it.minutes >= 2 }.sortedByDescending { it.durationMs }
+        return Disc(name, "movie", season, discNo, listOfNotNull(film), null, extras)
+    }
+
     /** The disc's titles (makemkvcon info). */
     fun titles(): List<Title> {
         val t0 = System.currentTimeMillis()
         val p = command(listOf("-r", "--cache=16", "info", "disc:0"), emptyMap()).start()
         proc = p
         val info = HashMap<Int, HashMap<Int, String>>()
+        discInfo.clear()
         pipeOutput(p) { l ->
+            Regex("""CINFO:(\d+),\d+,"(.*)"""").find(l)?.let { discInfo[it.groupValues[1].toInt()] = it.groupValues[2] }
             val m = Regex("""TINFO:(\d+),(\d+),\d+,"(.*)"""").find(l) ?: return@pipeOutput
             info.getOrPut(m.groupValues[1].toInt()) { HashMap() }[m.groupValues[2].toInt()] = m.groupValues[3]
         }
@@ -412,7 +464,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         return info.toSortedMap().map { (id, a) ->
             val parts = (a[9] ?: "0:0:0").split(':').map { it.toLongOrNull() ?: 0 }
             val ms = ((parts.getOrElse(0) { 0 } * 60 + parts.getOrElse(1) { 0 }) * 60 + parts.getOrElse(2) { 0 }) * 1000
-            Title(id, a[2] ?: "Title $id", ms, a[10] ?: "", a[27] ?: "title_t%02d.mkv".format(id))
+            Title(id, a[2] ?: "Title $id", ms, a[10] ?: "", a[27] ?: "title_t%02d.mkv".format(id), a[8]?.toIntOrNull() ?: 0)
         }
     }
 

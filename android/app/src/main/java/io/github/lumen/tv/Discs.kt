@@ -393,22 +393,22 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
                 else "Encrypted disc (AACS): its key is not in the key database").put("path", "").put("dir", false).put("off", true))
             val have = keyFiles().any { it.isFile }
             out.put(JSONObject().put("name", if (have) "Update the key database from the net" else "Load the key database from the net")
-                .put("path", "disc:$key|#keys").put("dir", false).put("action", "keys"))
-            out.put(JSONObject().put("name", "Why? (disc ID and key database)").put("path", "disc:$key|#info").put("dir", false).put("action", "info"))
+                .put("path", "disc:$key|#keys").put("dir", false).put("action", "keys").put("icon", "key"))
+            out.put(JSONObject().put("name", "Why? (disc ID and key database)").put("path", "disc:$key|#info").put("dir", false).put("action", "info").put("icon", "info"))
             return out
         }
         if (rel.isEmpty() && d.kind == "Blu-ray") {
             val streams = try { udf.list("BDMV/STREAM") } catch (_: IOException) { emptyList() }
             if (Bd.available())
                 out.put(JSONObject().put("name", "Play the disc with its menu").put("path", "disc:$key|#menu")
-                    .put("dir", false).put("uri", "bdnav://$key/").put("video", true))
+                    .put("dir", false).put("uri", "bdnav://$key/").put("video", true).put("icon", "disc"))
             for (e in streams.filter { !it.dir && it.name.endsWith(".m2ts", true) && playable(key, "BDMV/STREAM/${it.name}") }.sortedByDescending { it.size }) {
                 out.put(JSONObject().put("name", "Title " + e.name.substringBeforeLast('.')).put("path", "disc:$key|BDMV/STREAM/${e.name}")
                     .put("dir", false).put("size", e.size).put("uri", base + "BDMV/STREAM/" + e.name).put("video", true))
             }
-            out.put(JSONObject().put("name", "Copy the titles to storage").put("path", "disc:$key|#copy").put("dir", false).put("action", "copy"))
-            out.put(JSONObject().put("name", "Make MKV files of the titles").put("path", "disc:$key|#rip").put("dir", false).put("action", "rip"))
-            if (d.encrypted) out.put(JSONObject().put("name", "Protection of this disc (AACS)").put("path", "disc:$key|#info").put("dir", false).put("action", "info"))
+            out.put(JSONObject().put("name", "Copy the titles to storage").put("path", "disc:$key|#copy").put("dir", false).put("action", "copy").put("icon", "download"))
+            out.put(JSONObject().put("name", "Make MKV files of the titles").put("path", "disc:$key|#rip").put("dir", false).put("action", "rip").put("icon", "film"))
+            if (d.encrypted) out.put(JSONObject().put("name", "Protection of this disc (AACS)").put("path", "disc:$key|#info").put("dir", false).put("action", "info").put("icon", "info"))
             return out
         }
         if (rel.isEmpty() && d.kind == "DVD-Video") {
@@ -417,7 +417,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
                 out.put(JSONObject().put("name", e.name).put("path", "disc:$key|VIDEO_TS/${e.name}").put("dir", false)
                     .put("size", e.size).put("uri", base + "VIDEO_TS/" + e.name).put("video", true))
             }
-            out.put(JSONObject().put("name", "Copy the titles to storage").put("path", "disc:$key|#copy").put("dir", false).put("action", "copy"))
+            out.put(JSONObject().put("name", "Copy the titles to storage").put("path", "disc:$key|#copy").put("dir", false).put("action", "copy").put("icon", "download"))
             return out
         }
         // any other disc: its folders and files

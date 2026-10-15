@@ -407,25 +407,37 @@ class MainActivity : Activity() {
         if (!key.startsWith("usb") || !makemkv.available) return emptyList()
         val out = ArrayList<JSONObject>()
         val titles = mkTitles[key]
+        val de = java.util.Locale.getDefault().language == "de"
         if (titles == null) {
-            out.add(JSONObject().put("name", "MakeMKV (test): play the main title").put("path", "disc:$key|#mkplay")
-                .put("dir", false).put("uri", "makemkv://$key/main").put("video", true))
+            out.add(JSONObject().put("name", if (de) "Disc mit MakeMKV erkennen und abspielen" else "Identify the disc with MakeMKV and play it")
+                .put("detail", if (de) "dauert etwa eine Minute" else "takes about a minute").put("icon", "disc")
+                .put("path", "disc:$key|#mkplay").put("dir", false).put("uri", "makemkv://$key/main").put("video", true))
         } else {
-            for (t in titles.sortedByDescending { it.durationMs })
-                out.add(JSONObject().put("name", "MakeMKV: ${t.name} – ${t.durationMs / 60000} min, ${t.size}").put("path", "disc:$key|#mk${t.id}")
-                    .put("dir", false).put("uri", "makemkv://$key/${t.id}").put("video", true))
+            val d = makemkv.identify(titles)
+            out.add(JSONObject().put("name", d.label(de).ifEmpty { if (de) "Unbekannte Disc" else "Unknown disc" })
+                .put("detail", if (d.kind == "episodes") (if (de) "${d.main.size} Episoden" else "${d.main.size} episodes")
+                    else (if (de) "Film" else "Film") + d.main.firstOrNull()?.let { " · ${it.minutes} min" }.orEmpty())
+                .put("icon", if (d.kind == "episodes") "episodes" else "film").put("path", "").put("dir", false).put("off", true))
+            fun add(t: MakeMkv.Title, label: String, icon: String) = out.add(JSONObject().put("name", label)
+                .put("detail", "${t.minutes} min · ${t.size}").put("icon", icon).put("path", "disc:$key|#mk${t.id}")
+                .put("dir", false).put("uri", "makemkv://$key/${t.id}").put("video", true))
+            if (d.kind == "episodes") {
+                d.all?.let { add(it, if (de) "Alle Episoden hintereinander" else "Play all episodes", "episodes") }
+                d.main.forEachIndexed { i, t -> add(t, if (de) "Episode ${i + 1}" else "Episode ${i + 1}", "film") }
+            } else d.main.firstOrNull()?.let { add(it, if (de) "Film abspielen" else "Play the film", "film") }
+            d.extras.take(12).forEach { t -> add(t, (if (de) "Extra: " else "Extra: ") + t.name.takeIf { it != d.name && !it.startsWith("Title") }.orEmpty().ifEmpty { "#${t.id}" }, "extra") }
         }
         val plan = try { makemkv.cachePlan() } catch (_: Exception) { null }
         val modeName = when (makemkv.cacheMode) { "ram" -> "memory"; "storage" -> "storage"; else -> "automatic" }
         out.add(JSONObject().put("name", "MakeMKV cache: $modeName" + (plan?.let { " (now $it)" } ?: ""))
-            .put("path", "disc:$key|#mkcache").put("dir", false).put("action", "mkcache"))
+            .put("path", "disc:$key|#mkcache").put("dir", false).put("action", "mkcache").put("icon", "tune"))
         out.add(JSONObject().put("name", "MakeMKV cache size: " + (if (makemkv.cacheMb > 0) "${makemkv.cacheMb} MB" else "automatic"))
-            .put("path", "disc:$key|#mksize").put("dir", false).put("action", "mksize"))
+            .put("path", "disc:$key|#mksize").put("dir", false).put("action", "mksize").put("icon", "tune"))
         val mode = makemkv.keyMode
         out.add(JSONObject().put("name", "MakeMKV key: the beta key from the forum, updated daily" + if (mode == "beta") " (in use)" else "")
-            .put("path", "disc:$key|#mkbeta").put("dir", false).put("action", "mkbeta"))
+            .put("path", "disc:$key|#mkbeta").put("dir", false).put("action", "mkbeta").put("icon", "key"))
         out.add(JSONObject().put("name", "MakeMKV key: enter your own" + if (mode == "manual") " (in use)" else "")
-            .put("path", "disc:$key|#mkown").put("dir", false).put("action", "mkown"))
+            .put("path", "disc:$key|#mkown").put("dir", false).put("action", "mkown").put("icon", "key"))
         return out
     }
 
@@ -502,7 +514,7 @@ class MainActivity : Activity() {
             js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
         }
         if (mkKey != key) return true
-        val t = (if (which == "main") titles.maxByOrNull { it.durationMs } else titles.firstOrNull { it.id.toString() == which })
+        val t = (if (which == "main") makemkv.identify(titles).let { d -> d.all ?: d.main.firstOrNull() } else titles.firstOrNull { it.id.toString() == which })
         if (t == null) { say("MakeMKV found no title on this disc (see makemkv-log.txt).", 10000); stopMakeMkv(); return true }
         say("MakeMKV: starting ${t.name} (${t.durationMs / 60000} min) …", 60000)
         makemkv.clearCache()
