@@ -50,7 +50,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     private fun ensureTree() {
         if (!File(root, ".extracted").exists()) {
             log("unpacking MakeMKV's data files")
-            root.deleteRecursively(); root.mkdirs()
+            deleteTree(root); root.mkdirs()
             val tin = org.apache.commons.compress.archivers.tar.TarArchiveInputStream(activity.assets.open("makemkv/rootrest-$abi.tar"))
             var e = tin.nextEntry
             while (e != null) {
@@ -67,9 +67,15 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         for (n in listOf("sg0", "sr0")) File(root, "dev/$n").apply { if (!exists()) createNewFile() }
     }
 
+    /** Deletes [f] without following links (the /sys tree links in circles). */
+    private fun deleteTree(f: File) {
+        if (!java.nio.file.Files.isSymbolicLink(f.toPath()) && f.isDirectory) f.listFiles()?.forEach { deleteTree(it) }
+        java.nio.file.Files.deleteIfExists(f.toPath())
+    }
+
     /** The entries a USB optical drive has in Linux's /sys: makemkvcon looks for drives there. */
     private fun fakeSysfs(vendor: String, model: String, rev: String) {
-        val sys = File(root, "sys"); sys.deleteRecursively()
+        val sys = File(root, "sys"); deleteTree(sys)
         val dev = File(sys, "devices/platform/lumen-usb/host0/target0:0:0/0:0:0:0"); dev.mkdirs()
         fun w(name: String, v: String) = File(dev, name).writeText(v + "\n")
         w("type", "5"); w("vendor", vendor); w("model", model); w("rev", rev)
@@ -206,11 +212,22 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
                 }
             } catch (e: Exception) { log("bridge server stopped: $e") }
         }
-        val id = inquiry()
+        return true
+    }
+
+    /** Asks the drive who it is (after a USB reset if it does not answer) and makes its /sys entry. */
+    fun identify(): Boolean {
+        var id = inquiry()
+        if (id == null) {
+            log("drive: no answer to INQUIRY, USB mass storage reset")
+            resetRecovery()
+            id = inquiry()
+        }
         log("drive: ${id?.let { "${it.first.trim()} ${it.second.trim()} ${it.third.trim()}" } ?: "no answer to INQUIRY"}")
+        if (id == null) return false
         ensureTree()
-        fakeSysfs(id?.first ?: "Unknown ", id?.second ?: "Optical drive   ", id?.third ?: "0000")
-        return id != null
+        fakeSysfs(id.first, id.second, id.third)
+        return true
     }
 
     fun closeBridge() {
@@ -341,9 +358,20 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         val out = File(root, "tmp/out"); out.deleteRecursively(); out.mkdirs()
         val fifo = File(out, t.file)
         android.system.Os.mkfifo(fifo.absolutePath, 0x1b6)
-        val p = command(listOf("-r", "--cache=64", "mkv", "disc:0", t.id.toString(), "/tmp/out"),
+        val p = command(listOf("-r", "--cache=32", "mkv", "disc:0", t.id.toString(), "/tmp/out"),
             mapOf("MMSHIM_STREAM" to "/tmp/out/", "MMSHIM_DURATION_MS" to t.durationMs.toString())).start()
         proc = p
+        kotlin.concurrent.thread(isDaemon = true) {
+            // memory of the television and of makemkvcon, every 15 s (debug)
+            while (p.isAlive) {
+                try {
+                    val mi = File("/proc/meminfo").readLines().associate { l -> l.substringBefore(':') to (l.substringAfter(':').trim().substringBefore(' ').toLongOrNull() ?: 0) }
+                    val rt = Runtime.getRuntime()
+                    log("memory: available ${mi["MemAvailable"]?.div(1024)} MB, free ${mi["MemFree"]?.div(1024)} MB, app heap ${(rt.totalMemory() - rt.freeMemory()) shr 20} MB, native ${android.os.Debug.getNativeHeapAllocatedSize() shr 20} MB")
+                } catch (_: Exception) { }
+                Thread.sleep(15000)
+            }
+        }
         kotlin.concurrent.thread(isDaemon = true) {
             pipeOutput(p)
             log("makemkvcon finished: exit ${p.waitFor()}")

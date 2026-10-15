@@ -115,9 +115,12 @@ class MainActivity : Activity() {
         playerLong = long
         val factory = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
         // a short look-ahead: the menu of a disc runs ahead of the picture by what the player has buffered;
-        // MakeMKV's stream comes in bursts: a long one
+        // MakeMKV's stream comes in bursts: a longer one, but held to 32 MB (MakeMKV needs the memory of a small television)
         val load = androidx.media3.exoplayer.DefaultLoadControl.Builder()
-            .apply { if (long) setBufferDurationsMs(20000, 60000, 5000, 8000) else setBufferDurationsMs(2000, 4000, 800, 1500) }.build()
+            .apply {
+                if (long) setBufferDurationsMs(10000, 30000, 4000, 6000).setTargetBufferBytes(32 shl 20).setPrioritizeTimeOverSizeThresholds(false)
+                else setBufferDurationsMs(2000, 4000, 800, 1500)
+            }.build()
         val p = ExoPlayer.Builder(this, factory).setLoadControl(load).build()
         p.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
@@ -188,7 +191,7 @@ class MainActivity : Activity() {
             // only Matroska, and no look for the index at the end: the stream cannot go there and back
             val extractors = androidx.media3.extractor.ExtractorsFactory {
                 arrayOf(androidx.media3.extractor.mkv.MatroskaExtractor(
-                    androidx.media3.extractor.text.SubtitleParser.Factory.UNSUPPORTED,
+                    androidx.media3.extractor.text.DefaultSubtitleParserFactory(),
                     androidx.media3.extractor.mkv.MatroskaExtractor.FLAG_DISABLE_SEEK_FOR_CUES))
             }
             val source = androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(factory, extractors)
@@ -374,11 +377,16 @@ class MainActivity : Activity() {
         mkKey = key
         try {
             say("MakeMKV: opening the drive …")
-            if (!makemkv.openBridge(device)) { say("MakeMKV: the drive does not answer (see makemkv-log.txt)."); stopMakeMkv(); return }
-            if (mkReload) {
+            if (!makemkv.openBridge(device)) { say("MakeMKV: the drive could not be opened (see makemkv-log.txt)."); stopMakeMkv(); return }
+            if (mkReload || !makemkv.identify()) {
                 mkReload = false
-                say("The disc is ejected and loaded again …", 60000)
-                makemkv.ejectAndReload()
+                mkLog("drive stuck before the start: eject and reload")
+                say("The drive does not answer: the disc is ejected and loaded again …", 60000)
+                if (!makemkv.ejectAndReload() || !makemkv.identify()) {
+                    mkLog("drive still stuck: the user is asked to switch it off and on")
+                    say("The drive still does not answer. Switch the drive off and on again, then start the film again.", 30000)
+                    stopMakeMkv(); return
+                }
             }
             for (attempt in 1..2) {
                 if (mkKey != key) return
@@ -395,7 +403,7 @@ class MainActivity : Activity() {
             mkLog("drive still stuck: the user is asked to switch it off and on")
             say("The drive still does not answer. Switch the drive off and on again, then start the film again.", 30000)
             stopMakeMkv()
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             mkLog("failed: ${android.util.Log.getStackTraceString(e)}")
             say("MakeMKV: $e")
             stopMakeMkv()
