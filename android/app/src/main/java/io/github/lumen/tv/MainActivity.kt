@@ -120,7 +120,7 @@ class MainActivity : Activity() {
         // MakeMKV's stream comes in bursts: a longer one, but held to 32 MB (MakeMKV needs the memory of a small television)
         val load = androidx.media3.exoplayer.DefaultLoadControl.Builder()
             .apply {
-                if (long) setBufferDurationsMs(10000, 30000, 4000, 6000).setTargetBufferBytes(24 shl 20).setPrioritizeTimeOverSizeThresholds(false)
+                if (long) setBufferDurationsMs(6000, 15000, 2500, 4000).setTargetBufferBytes(16 shl 20).setPrioritizeTimeOverSizeThresholds(false)
                 else setBufferDurationsMs(2000, 4000, 800, 1500)
             }.build()
         val p = ExoPlayer.Builder(this, factory).setLoadControl(load).build()
@@ -415,6 +415,12 @@ class MainActivity : Activity() {
                 out.add(JSONObject().put("name", "MakeMKV: ${t.name} – ${t.durationMs / 60000} min, ${t.size}").put("path", "disc:$key|#mk${t.id}")
                     .put("dir", false).put("uri", "makemkv://$key/${t.id}").put("video", true))
         }
+        val plan = try { makemkv.cachePlan() } catch (_: Exception) { null }
+        val modeName = when (makemkv.cacheMode) { "ram" -> "memory"; "storage" -> "storage"; else -> "automatic" }
+        out.add(JSONObject().put("name", "MakeMKV cache: $modeName" + (plan?.let { " (now $it)" } ?: ""))
+            .put("path", "disc:$key|#mkcache").put("dir", false).put("action", "mkcache"))
+        out.add(JSONObject().put("name", "MakeMKV cache size: " + (if (makemkv.cacheMb > 0) "${makemkv.cacheMb} MB" else "automatic"))
+            .put("path", "disc:$key|#mksize").put("dir", false).put("action", "mksize"))
         val mode = makemkv.keyMode
         out.add(JSONObject().put("name", "MakeMKV key: the beta key from the forum, updated daily" + if (mode == "beta") " (in use)" else "")
             .put("path", "disc:$key|#mkbeta").put("dir", false).put("action", "mkbeta"))
@@ -499,7 +505,10 @@ class MainActivity : Activity() {
         val t = (if (which == "main") titles.maxByOrNull { it.durationMs } else titles.firstOrNull { it.id.toString() == which })
         if (t == null) { say("MakeMKV found no title on this disc (see makemkv-log.txt).", 10000); stopMakeMkv(); return true }
         say("MakeMKV: starting ${t.name} (${t.durationMs / 60000} min) …", 60000)
-        val pipe = PipeStream(makemkv.stream(t)) { mkLog(it) }
+        makemkv.clearCache()
+        val plan = makemkv.cachePlan()
+        mkLog("cache: $plan (${plan.why})")
+        val pipe = PipeStream(makemkv.stream(t), plan.bytes, plan.file, { mkLog(it) }, { on -> makemkv.hold(on) })
         mkPipe = pipe
         val t0 = System.currentTimeMillis()
         if (!pipe.awaitStart()) {
@@ -507,6 +516,10 @@ class MainActivity : Activity() {
             say("MakeMKV stopped before the film began (see makemkv-log.txt).", 10000); stopMakeMkv(); return true
         }
         mkLog("first bytes after ${System.currentTimeMillis() - t0} ms")
+        // a head start: the player begins when a few seconds of film are in the cache
+        val until = System.currentTimeMillis() + 15000
+        while (System.currentTimeMillis() < until && pipe.ahead() < minOf(plan.bytes / 2, 48L shl 20) && mkKey == key) Thread.sleep(200)
+        mkLog("player starts with %.0f MB in the cache".format(java.util.Locale.ROOT, pipe.ahead() / 1e6))
         if (mkKey != key) return true
         main.post { open(uri, false, null) }
         return true
@@ -626,6 +639,15 @@ class MainActivity : Activity() {
                     "#info" -> say(discs.keyInfo(key, true))
                     "#mkbeta" -> { makemkv.useBetaKey(); say("MakeMKV: the beta key is fetched from the forum now and every day.") }
                     "#mkown" -> askOwnKey()
+                    "#mkcache" -> {
+                        makemkv.cacheMode = when (makemkv.cacheMode) { "auto" -> "ram"; "ram" -> "storage"; else -> "auto" }
+                        say("MakeMKV cache: ${makemkv.cachePlan()}")
+                    }
+                    "#mksize" -> {
+                        val sizes = listOf(0, 64, 128, 256, 512, 1024)
+                        makemkv.cacheMb = sizes[(sizes.indexOf(makemkv.cacheMb) + 1) % sizes.size]
+                        say("MakeMKV cache: ${makemkv.cachePlan()}")
+                    }
                     else -> discs.copy(key, say)
                 }
                 reply(id, "[]")

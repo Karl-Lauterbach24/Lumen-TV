@@ -168,6 +168,55 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         }
     }
 
+    // ---------------------------------------------------------------- the cache between MakeMKV and the player
+
+    /** "auto", "ram" or "storage" */
+    var cacheMode: String
+        get() = prefs.getString("cacheMode", "auto") ?: "auto"
+        set(v) { prefs.edit().putString("cacheMode", v).apply() }
+    /** MB; 0 = chosen by the app */
+    var cacheMb: Int
+        get() = prefs.getInt("cacheMb", 0)
+        set(v) { prefs.edit().putInt("cacheMb", v).apply() }
+
+    class CachePlan(val file: File?, val bytes: Long, val why: String) {
+        override fun toString() = "${if (file == null) "memory" else "storage"}, ${bytes shr 20} MB"
+    }
+
+    private val cacheDir get() = File(activity.cacheDir, "makemkv-stream")
+
+    /** Removes the cache file of an earlier film (one that ended with the app). */
+    fun clearCache() { cacheDir.listFiles()?.forEach { it.delete() } }
+
+    /**
+     * Memory where the television has plenty (a quarter of what is free, up to 512 MB); otherwise the
+     * television's storage (what is free beyond 300 MB, up to 1 GB); the user's choice of place and size first.
+     */
+    fun cachePlan(): CachePlan {
+        val am = activity.getSystemService(android.app.ActivityManager::class.java)
+        val mi = android.app.ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
+        cacheDir.mkdirs()
+        val freeDisk = cacheDir.usableSpace
+        val mb = 1L shl 20
+        fun round(b: Long) = (b / (16 * mb)) * 16 * mb
+        val ramAuto = round((mi.availMem / 4).coerceIn(32 * mb, 512 * mb))
+        val diskAuto = round((freeDisk - 300 * mb).coerceIn(0, 1024 * mb))
+        val bigRam = mi.totalMem >= 2560 * mb && !mi.lowMemory
+        val mode = when (cacheMode) {
+            "ram" -> "ram"
+            "storage" -> if (diskAuto >= 64 * mb || (cacheMb > 0 && freeDisk - cacheMb * mb > 100 * mb)) "storage" else "ram"
+            else -> if (bigRam || diskAuto < 128 * mb) "ram" else "storage"
+        }
+        val why = "television: ${mi.totalMem / mb} MB memory (${mi.availMem / mb} free), ${freeDisk / mb} MB storage free; setting ${cacheMode}/${if (cacheMb > 0) "$cacheMb MB" else "auto"}"
+        return if (mode == "ram") {
+            val want = if (cacheMb > 0) cacheMb * mb else ramAuto
+            CachePlan(null, want.coerceIn(16 * mb, 1024 * mb), why)
+        } else {
+            val want = if (cacheMb > 0) minOf(cacheMb * mb, freeDisk - 100 * mb) else diskAuto
+            CachePlan(File(cacheDir, "stream.cache"), want.coerceAtLeast(32 * mb), why)
+        }
+    }
+
     // ---------------------------------------------------------------- the drive
 
     private var conn: UsbDeviceConnection? = null
@@ -393,6 +442,21 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         return fifo
     }
 
+    /** makemkvcon's own process (a child of proot): its pid, from /proc. */
+    private fun makemkvconPid(): Int = File("/proc").listFiles().orEmpty().mapNotNull { it.name.toIntOrNull() }.firstOrNull { pid ->
+        try { File("/proc/$pid/cmdline").readText().contains("/usr/bin/makemkvcon") && !File("/proc/$pid/cmdline").readText().startsWith(nativeDir) } catch (_: Exception) { false }
+    } ?: -1
+
+    /**
+     * Holds makemkvcon while the cache is full: waiting for room it keeps a core busy in the kernel, which
+     * the picture of a small television needs. (SIGSTOP / SIGCONT; proot passes them on.)
+     */
+    fun hold(on: Boolean) {
+        val pid = makemkvconPid()
+        if (pid <= 0) return
+        android.os.Process.sendSignal(pid, if (on) 19 else 18)
+    }
+
     private fun pidOf(p: Process): Int = try {
         p.javaClass.getDeclaredField("pid").apply { isAccessible = true }.getInt(p)
     } catch (_: Exception) { -1 }
@@ -427,43 +491,121 @@ class PipeDataSource(private val pipe: PipeStream) : androidx.media3.datasource.
     override fun close() { if (uri != null) { uri = null; transferEnded() } }
 }
 
-/** One pass over the pipe; the player may reopen at the position it got to (or ahead of it), not behind. */
-class PipeStream(private val file: File, private val stats: (String) -> Unit) {
+/**
+ * Where MakeMKV's stream waits for the player: a ring of [capacity] bytes in memory (outside the Java heap) or
+ * in a file on the television's storage ([file]). A thread fills it from the pipe as fast as MakeMKV and the
+ * drive deliver, so a drive that pauses for a few seconds is not seen by the player. A quarter of the ring
+ * keeps what was played (the player may go back that far); the rest is read ahead.
+ */
+class PipeStream(private val fifo: File, private val capacity: Long, private val file: File?, private val stats: (String) -> Unit,
+                 private val hold: (Boolean) -> Unit = {}) {
+    private val lock = Object()
+    private val mem: java.nio.ByteBuffer? = if (file == null) java.nio.ByteBuffer.allocateDirect(capacity.toInt()) else null
+    private val disk: java.nio.channels.FileChannel? = file?.let { java.io.RandomAccessFile(it, "rw").channel }
+    private val keepBehind = capacity / 4
+    @Volatile private var written = 0L
+    @Volatile private var eof = false
+    @Volatile private var closed = false
     @Volatile private var input: InputStream? = null
-    var position = 0L; private set
-    private var t0 = 0L; private var tl = 0L; private var lastPos = 0L
+    /** where the player reads */
+    @Volatile var position = 0L; private set
+    private var t0 = 0L; private var tl = 0L; private var lastPos = 0L; private var lastWritten = 0L
+    private var minAhead = Long.MAX_VALUE
 
-    /** Waits until MakeMKV has written something (it reads the disc's structure first); false: it ended without. */
+    fun ahead(): Long = written - position
+    private var holds = 0
+    private fun limit() = position - keepBehind.coerceAtMost(position) + capacity
+
+    val where get() = if (file == null) "memory" else "storage"
+
+    /** Starts filling and waits until MakeMKV has written something; false: it ended without. */
     fun awaitStart(): Boolean {
-        val i = java.io.BufferedInputStream(java.io.FileInputStream(file), 1 shl 20)
-        i.mark(1)
-        val first = i.read()
-        i.reset()
-        synchronized(this) { input = i; t0 = System.currentTimeMillis(); tl = t0 }
-        return first >= 0
+        val i = java.io.FileInputStream(fifo)       // (waits for MakeMKV to open the pipe)
+        input = i
+        t0 = System.currentTimeMillis(); tl = t0
+        kotlin.concurrent.thread(isDaemon = true, name = "makemkv-cache") { fill(i) }
+        synchronized(lock) { while (written == 0L && !eof && !closed) lock.wait(1000) }
+        return written > 0
     }
 
-    @Synchronized fun seekTo(pos: Long) {
-        if (input == null) { input = java.io.FileInputStream(file); t0 = System.currentTimeMillis(); tl = t0 }
-        if (pos < position) throw java.io.IOException("the MakeMKV stream cannot go back (asked for $pos, at $position)")
-        while (position < pos) {
-            val s = input!!.skip(pos - position)
-            if (s <= 0) throw java.io.EOFException()
-            position += s
+    private fun fill(i: InputStream) {
+        val buf = ByteArray(256 * 1024)
+        try {
+            while (!closed) {
+                // room: up to capacity, minus what is kept behind the player. Full: MakeMKV is held
+                // until half of the read-ahead has been played
+                var held = false
+                synchronized(lock) {
+                    if (written + buf.size > limit()) {
+                        held = true; holds++; hold(true)
+                        while (!closed && written - position > (limit() - position) / 2) lock.wait(500)
+                    }
+                }
+                if (held) hold(false)
+                if (closed) break
+                val n = i.read(buf)
+                if (n < 0) break
+                put(written, buf, n)
+                synchronized(lock) { written += n; lock.notifyAll() }
+            }
+        } catch (e: Exception) {
+            if (!closed) stats("cache: filling stopped: $e")
+        } finally {
+            synchronized(lock) { eof = true; lock.notifyAll() }
         }
     }
 
-    @Synchronized fun read(b: ByteArray, off: Int, len: Int): Int {
-        val n = input?.read(b, off, len) ?: -1
-        if (n > 0) position += n
+    private fun put(at: Long, b: ByteArray, n: Int) {
+        var done = 0
+        while (done < n) {
+            val ring = ((at + done) % capacity)
+            val k = minOf(n - done, (capacity - ring).toInt())
+            if (mem != null) { val d = mem.duplicate(); d.position(ring.toInt()); d.put(b, done, k) }
+            else disk!!.write(java.nio.ByteBuffer.wrap(b, done, k), ring)
+            done += k
+        }
+    }
+
+    private fun get(at: Long, b: ByteArray, off: Int, n: Int): Int {
+        val ring = at % capacity
+        val k = minOf(n, (capacity - ring).toInt())
+        if (mem != null) { val d = mem.duplicate(); d.position(ring.toInt()); d.get(b, off, k); return k }
+        return disk!!.read(java.nio.ByteBuffer.wrap(b, off, k), ring).coerceAtLeast(0)
+    }
+
+    fun seekTo(pos: Long) {
+        synchronized(lock) {
+            val oldest = maxOf(0L, written - capacity + 256 * 1024)
+            if (pos < oldest) throw java.io.IOException("the MakeMKV stream is no longer in the cache (asked for $pos, oldest $oldest)")
+            position = pos
+            lock.notifyAll()
+        }
+    }
+
+    fun read(b: ByteArray, off: Int, len: Int): Int {
+        synchronized(lock) {
+            while (position >= written && !eof && !closed) lock.wait(500)
+            if (closed || position >= written) return -1
+        }
+        val n = get(position, b, off, minOf(len.toLong(), written - position).toInt())
+        synchronized(lock) { position += n; minAhead = minOf(minAhead, written - position); lock.notifyAll() }
         val now = System.currentTimeMillis()
         if (now - tl >= 5000) {
-            stats("stream: %.1f MB, now %.2f MB/s, average %.2f MB/s".format(java.util.Locale.ROOT, position / 1e6, (position - lastPos) / 1e3 / (now - tl), position / 1e3 / (now - t0)))
-            tl = now; lastPos = position
+            stats("stream: played %.1f MB, cache %s %.0f MB ahead (least %.0f MB), MakeMKV held %d×, in %.2f MB/s, out %.2f MB/s".format(java.util.Locale.ROOT,
+                position / 1e6, where, (written - position) / 1e6, minAhead / 1e6, holds,
+                (written - lastWritten) / 1e3 / (now - tl), (position - lastPos) / 1e3 / (now - tl)))
+            tl = now; lastPos = position; lastWritten = written; minAhead = Long.MAX_VALUE
         }
         return n
     }
 
     /** (not synchronized: a read may be waiting for MakeMKV) */
-    fun close() { try { input?.close() } catch (_: Exception) { }; input = null }
+    fun close() {
+        closed = true
+        try { hold(false) } catch (_: Exception) { }
+        synchronized(lock) { lock.notifyAll() }
+        try { input?.close() } catch (_: Exception) { }
+        try { disk?.close() } catch (_: Exception) { }
+        file?.delete()
+    }
 }
