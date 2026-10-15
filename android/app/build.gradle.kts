@@ -17,8 +17,15 @@ android {
         targetSdk = 35
         versionCode = major * 10000 + minor * 100 + patch
         versionName = appVersion
+        // -Pabis=armeabi-v7a: a smaller package for one kind of television
+        (project.findProperty("abis") as String?)?.let { ndk { abiFilters += it.split(",") } }
     }
     buildTypes {
+        // the MakeMKV test build installs beside the released app (own name, own data)
+        debug {
+            applicationIdSuffix = ".mkvtest"
+            versionNameSuffix = "-mkvtest"
+        }
         release {
             isMinifyEnabled = false
         }
@@ -29,6 +36,13 @@ android {
     }
     kotlinOptions {
         jvmTarget = "17"
+    }
+    // MakeMKV (test): its Linux programs ship as lib*.so so they land, runnable, in the native library folder
+    packaging {
+        jniLibs { useLegacyPackaging = true }
+    }
+    androidResources {
+        noCompress += listOf("tar")
     }
 }
 
@@ -52,5 +66,6 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:1.5.1")
     implementation("androidx.media3:media3-ui:1.5.1")
     implementation("androidx.webkit:webkit:1.12.1")
+    implementation("org.apache.commons:commons-compress:1.26.1")
     testImplementation("junit:junit:4.13.2")
 }

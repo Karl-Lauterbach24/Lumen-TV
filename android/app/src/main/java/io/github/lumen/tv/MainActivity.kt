@@ -53,6 +53,12 @@ class MainActivity : Activity() {
     private lateinit var bdIg: android.widget.ImageView
     private val bdBitmaps = arrayOfNulls<android.graphics.Bitmap>(2)
     private var lastLogged = -1L
+    // MakeMKV (test build): the drive lent to it, the pipe the player reads
+    private lateinit var makemkv: MakeMkv
+    @Volatile private var mkKey: String? = null
+    private var mkPipe: PipeStream? = null
+    private val mkTitles = HashMap<String, List<MakeMkv.Title>>()
+    private var playerLong = false
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -66,6 +72,11 @@ class MainActivity : Activity() {
         discs = Discs(this) { js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()") }
         drives = Drives(this, discs)
         drives.onPermission = { js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()") }
+        makemkv = MakeMkv(this) { mkLog(it) }
+        mkLog("Lumen TV ${packageManager.getPackageInfo(packageName, 0).versionName}, ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}, " +
+            "MakeMKV ${if (makemkv.available) "available (${makemkv.abi})" else "not available on this device"}, key: ${makemkv.keyMode.ifEmpty { "none" }}")
+        makemkv.refreshBetaKeyIfDue()
+        discs.extraEntries = { key -> mkEntries(key) }
 
         web.setBackgroundColor(Color.TRANSPARENT)
         web.settings.apply {
@@ -90,12 +101,14 @@ class MainActivity : Activity() {
     }
 
     // ---- the player behind the page ----
-    private fun ensurePlayer(): ExoPlayer {
-        player?.let { return it }
+    private fun ensurePlayer(long: Boolean = false): ExoPlayer {
+        player?.let { if (playerLong == long) return it; it.release(); player = null }
+        playerLong = long
         val factory = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
-        // a short look-ahead: the menu of a disc runs ahead of the picture by what the player has buffered
+        // a short look-ahead: the menu of a disc runs ahead of the picture by what the player has buffered;
+        // MakeMKV's stream comes in bursts: a long one
         val load = androidx.media3.exoplayer.DefaultLoadControl.Builder()
-            .setBufferDurationsMs(2000, 4000, 800, 1500).build()
+            .apply { if (long) setBufferDurationsMs(20000, 60000, 5000, 8000) else setBufferDurationsMs(2000, 4000, 800, 1500) }.build()
         val p = ExoPlayer.Builder(this, factory).setLoadControl(load).build()
         p.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
@@ -124,6 +137,7 @@ class MainActivity : Activity() {
                     else -> "Playback stopped: ${error.errorCodeName}${cause?.message?.let { " – $it" } ?: ""}$what"
                 }
                 android.util.Log.w("LumenTV", "player error: $why / $error")
+                if (mkKey != null) mkLog("player error: $why / $error ${android.util.Log.getStackTraceString(error).take(1500)}")
                 event("error")
                 // (after the page's own "does not play" message, which it shows at once)
                 main.postDelayed({ js("window.lumenToast&&window.lumenToast(${JSONObject.quote(why)},20000)") }, 500)
@@ -158,8 +172,21 @@ class MainActivity : Activity() {
 
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     private fun open(uri: Uri, hls: Boolean, prepared: androidx.media3.extractor.ExtractorsFactory? = null) {
-        val p = ensurePlayer()
-        if (uri.scheme == "bdnav") {
+        val p = ensurePlayer(uri.scheme == "makemkv")
+        if (uri.scheme == "makemkv") {
+            val pipe = mkPipe ?: return
+            val factory = androidx.media3.datasource.DataSource.Factory { PipeDataSource(pipe) }
+            // only Matroska, and no look for the index at the end: the stream cannot go there and back
+            val extractors = androidx.media3.extractor.ExtractorsFactory {
+                arrayOf(androidx.media3.extractor.mkv.MatroskaExtractor(
+                    androidx.media3.extractor.text.SubtitleParser.Factory.UNSUPPORTED,
+                    androidx.media3.extractor.mkv.MatroskaExtractor.FLAG_DISABLE_SEEK_FOR_CUES))
+            }
+            val source = androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(factory, extractors)
+                .setContinueLoadingCheckIntervalBytes(256 * 1024)
+                .createMediaSource(MediaItem.fromUri(uri))
+            p.setMediaSource(source)
+        } else if (uri.scheme == "bdnav") {
             val b = bd ?: return
             val factory = BdDataSource.Factory(b) { type, value -> bdEvent(type, value) }
             val extractors = androidx.media3.extractor.DefaultExtractorsFactory()
@@ -268,9 +295,112 @@ class MainActivity : Activity() {
 
     private fun closePlayer() {
         closeBd()
+        stopMakeMkv()
         main.removeCallbacks(tick)
         player?.let { it.stop(); it.clearMediaItems() }
         playerView.visibility = View.INVISIBLE
+    }
+
+    // ---- MakeMKV (test build) ----
+    private val mkLogFile by lazy { java.io.File(getExternalFilesDir(null) ?: filesDir, "makemkv-log.txt") }
+
+    /** Debug log: logcat (LumenMKV) and Android/data/io.github.lumen.tv/files/makemkv-log.txt */
+    fun mkLog(msg: String) {
+        android.util.Log.i("LumenMKV", msg)
+        try {
+            synchronized(mkLogFile) {
+                if (mkLogFile.length() > 4_000_000) mkLogFile.renameTo(java.io.File(mkLogFile.path + ".old"))
+                mkLogFile.appendText(java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.ROOT).format(java.util.Date()) + " " + msg + "\n")
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun say(msg: String, ms: Int = 7000) = js("window.lumenToast&&window.lumenToast(${JSONObject.quote(msg)},$ms)")
+
+    private fun mkEntries(key: String): List<JSONObject> {
+        if (!key.startsWith("usb") || !makemkv.available) return emptyList()
+        val out = ArrayList<JSONObject>()
+        val titles = mkTitles[key]
+        if (titles == null) {
+            out.add(JSONObject().put("name", "MakeMKV (test): play the main title").put("path", "disc:$key|#mkplay")
+                .put("dir", false).put("uri", "makemkv://$key/main").put("video", true))
+        } else {
+            for (t in titles.sortedByDescending { it.durationMs })
+                out.add(JSONObject().put("name", "MakeMKV: ${t.name} – ${t.durationMs / 60000} min, ${t.size}").put("path", "disc:$key|#mk${t.id}")
+                    .put("dir", false).put("uri", "makemkv://$key/${t.id}").put("video", true))
+        }
+        val mode = makemkv.keyMode
+        out.add(JSONObject().put("name", "MakeMKV key: the beta key from the forum, updated daily" + if (mode == "beta") " (in use)" else "")
+            .put("path", "disc:$key|#mkbeta").put("dir", false).put("action", "mkbeta"))
+        out.add(JSONObject().put("name", "MakeMKV key: enter your own" + if (mode == "manual") " (in use)" else "")
+            .put("path", "disc:$key|#mkown").put("dir", false).put("action", "mkown"))
+        return out
+    }
+
+    private fun askOwnKey() = main.post {
+        val edit = android.widget.EditText(this).apply { setSingleLine(); setText(makemkv.ownKey()); hint = "T-…  or  M-…" }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Your MakeMKV registration key")
+            .setView(edit)
+            .setPositiveButton("OK") { _, _ ->
+                val k = edit.text.toString().trim()
+                if (k.length < 20) say("That is not a MakeMKV key.")
+                else kotlin.concurrent.thread { makemkv.setOwnKey(k); say("MakeMKV: your key is entered."); js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()") }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Runs on a worker thread: lends the drive to MakeMKV, has it stream the title, plays the stream. */
+    private fun startMakeMkv(uri: Uri) {
+        val key = uri.host ?: return
+        val which = uri.path.orEmpty().trim('/')
+        val closed = java.util.concurrent.CountDownLatch(1)
+        main.post { closePlayer(); closed.countDown() }
+        closed.await()
+        mkLog("---- play $uri")
+        if (makemkv.keyMode.isEmpty()) say("MakeMKV has no key yet: choose the forum's beta key or enter your own (in the drive's list).", 10000)
+        val device = discs.lend(key)
+        if (device == null) { say("The drive is gone."); discs.giveBack(key); return }
+        mkKey = key
+        try {
+            say("MakeMKV: opening the drive …")
+            if (!makemkv.openBridge(device)) { say("MakeMKV: the drive does not answer (see makemkv-log.txt)."); stopMakeMkv(); return }
+            if (mkKey != key) return
+            var titles = mkTitles[key]
+            if (titles == null) {
+                say("MakeMKV: reading the disc (this takes a minute) …", 60000)
+                titles = makemkv.titles()
+                mkLog("titles: " + titles.joinToString(" | "))
+                if (titles.isNotEmpty()) mkTitles[key] = titles
+                js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
+            }
+            if (mkKey != key) return
+            val t = (if (which == "main") titles.maxByOrNull { it.durationMs } else titles.firstOrNull { it.id.toString() == which })
+            if (t == null) { say("MakeMKV found no title on this disc (see makemkv-log.txt).", 10000); stopMakeMkv(); return }
+            say("MakeMKV: starting ${t.name} (${t.durationMs / 60000} min) …", 60000)
+            val pipe = PipeStream(makemkv.stream(t)) { mkLog(it) }
+            mkPipe = pipe
+            val t0 = System.currentTimeMillis()
+            if (!pipe.awaitStart()) { say("MakeMKV stopped before the film began (see makemkv-log.txt).", 10000); stopMakeMkv(); return }
+            mkLog("first bytes after ${System.currentTimeMillis() - t0} ms")
+            if (mkKey != key) return
+            main.post { open(uri, false, null) }
+        } catch (e: Exception) {
+            mkLog("failed: ${android.util.Log.getStackTraceString(e)}")
+            say("MakeMKV: $e")
+            stopMakeMkv()
+        }
+    }
+
+    private fun stopMakeMkv() {
+        val key = mkKey ?: return
+        mkKey = null
+        mkLog("---- stop (${mkPipe?.position?.let { "%.1f MB played".format(java.util.Locale.ROOT, it / 1e6) } ?: "nothing played"})")
+        makemkv.stop()
+        mkPipe?.close(); mkPipe = null
+        makemkv.closeBridge()
+        discs.giveBack(key)
     }
 
     // ---- keys: the page asks for them as the keyCodes of a TV browser ----
@@ -330,6 +460,7 @@ class MainActivity : Activity() {
         main.removeCallbacks(tick)
         player?.release()
         player = null
+        stopMakeMkv()
         discs.close()
         web.destroy()
         super.onDestroy()
@@ -355,6 +486,7 @@ class MainActivity : Activity() {
             kotlin.concurrent.thread {
                 val u = Uri.parse(url)
                 if (u.scheme == "bdnav") { startBd(u); return@thread }
+                if (u.scheme == "makemkv") { startMakeMkv(u); return@thread }
                 val prepared = prepare(u)
                 main.post { open(u, hls, prepared) }
             }
@@ -373,6 +505,8 @@ class MainActivity : Activity() {
                     "#rip" -> discs.rip(key, say)
                     "#keys" -> discs.loadKeyDatabase(say)
                     "#info" -> say(discs.keyInfo(key, true))
+                    "#mkbeta" -> { makemkv.useBetaKey(); say("MakeMKV: the beta key is fetched from the forum now and every day.") }
+                    "#mkown" -> askOwnKey()
                     else -> discs.copy(key, say)
                 }
                 reply(id, "[]")

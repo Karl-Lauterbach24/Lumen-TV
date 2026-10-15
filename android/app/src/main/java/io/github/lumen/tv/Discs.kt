@@ -72,6 +72,26 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
 
     fun udf(key: String): Udf? = synchronized(open) { open[key]?.udf }
 
+    // ---- a drive lent to MakeMKV (test): the app lets go of it and does not touch it until it is given back ----
+    private val lent = HashSet<String>()
+    /** Entries put before a drive's own (MakeMKV's), for the drive's first page. */
+    var extraEntries: ((key: String) -> List<JSONObject>)? = null
+
+    fun lend(key: String): UsbDevice? {
+        synchronized(lent) { lent.add(key) }
+        // a drive the app is still opening (spinning up) is let go of once that is done
+        val until = System.currentTimeMillis() + 60_000
+        while (synchronized(opening) { key in opening } && System.currentTimeMillis() < until) Thread.sleep(200)
+        synchronized(open) { open.remove(key)?.source?.close() }
+        changed()
+        return usb.deviceList.entries.firstOrNull { usbKey(it.key) == key }?.value
+    }
+
+    fun giveBack(key: String) {
+        synchronized(lent) { lent.remove(key) }
+        changed()
+    }
+
     /** A file of the disc as plain bytes: the streams of an AACS disc are decrypted as they are read. */
     fun reader(key: String, path: String): RandomReader? {
         val d = synchronized(open) { open[key] } ?: return null
@@ -228,6 +248,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             }
             val key = usbKey(name)
             present.add(key)
+            if (synchronized(lent) { key in lent }) { out.add(Disc(key, device.productName ?: "Disc drive", "", null, null, false, "makemkv")); continue }
             val cached = synchronized(open) { open[key] }
             if (cached != null) {
                 // a disc that was taken out or changed, or a drive that had none: look again
@@ -257,7 +278,8 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             if (start) kotlin.concurrent.thread {
                 try {
                     val disc = openDrive(key, device, iface)
-                    if (disc != null) synchronized(open) { open[key] = disc }
+                    if (disc != null && synchronized(lent) { key in lent }) disc.source?.close()
+                    else if (disc != null) synchronized(open) { open[key] = disc }
                     else other.add(describeDevice(device) + " – not an optical drive or not readable")
                 } catch (e: Exception) {
                     android.util.Log.w("LumenTV", "opening the drive failed: $e")
@@ -342,6 +364,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
                 "reading" -> "reading the disc …"
                 "empty" -> "no disc"
                 "unreadable" -> "cannot be read"
+                "makemkv" -> "in use by MakeMKV"
                 else -> listOf(d.kind, if (d.encrypted) (if (d.keys != null) "AACS, key known" else "AACS") else "").filter { it.isNotEmpty() }.joinToString(" · ")
             }
             a.put(JSONObject().put("name", d.label).put("path", "disc:${d.key}|").put("detail", detail))
@@ -351,6 +374,16 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     }
 
     fun folder(key: String, rel: String): JSONArray {
+        val extra = if (rel.isEmpty()) extraEntries?.invoke(key).orEmpty() else emptyList()
+        if (extra.isEmpty()) return ownFolder(key, rel)
+        val out = JSONArray()
+        extra.forEach { out.put(it) }
+        val own = ownFolder(key, rel)
+        for (i in 0 until own.length()) out.put(own.get(i))
+        return out
+    }
+
+    private fun ownFolder(key: String, rel: String): JSONArray {
         val d = synchronized(open) { open[key] } ?: return JSONArray()
         val udf = d.udf ?: return JSONArray()
         val out = JSONArray()
