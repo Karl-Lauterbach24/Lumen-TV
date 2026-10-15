@@ -59,6 +59,8 @@ class MainActivity : Activity() {
     private var mkPipe: PipeStream? = null
     private val mkTitles = HashMap<String, List<MakeMkv.Title>>()
     private var playerLong = false
+    /** the drive got stuck during a film: the disc is ejected and loaded again before the next one */
+    @Volatile private var mkReload = false
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -77,6 +79,13 @@ class MainActivity : Activity() {
             "MakeMKV ${if (makemkv.available) "available (${makemkv.abi})" else "not available on this device"}, key: ${makemkv.keyMode.ifEmpty { "none" }}")
         makemkv.refreshBetaKeyIfDue()
         discs.extraEntries = { key -> mkEntries(key) }
+        makemkv.onStuck = {
+            if ((mkPipe?.position ?: 0L) > 0L) {
+                mkReload = true
+                mkLog("drive stuck during the film")
+                say("The drive stopped answering during the film. Start it again (the disc is ejected and loaded again first).", 20000)
+            }
+        }
 
         web.setBackgroundColor(Color.TRANSPARENT)
         web.settings.apply {
@@ -366,31 +375,59 @@ class MainActivity : Activity() {
         try {
             say("MakeMKV: opening the drive …")
             if (!makemkv.openBridge(device)) { say("MakeMKV: the drive does not answer (see makemkv-log.txt)."); stopMakeMkv(); return }
-            if (mkKey != key) return
-            var titles = mkTitles[key]
-            if (titles == null) {
-                say("MakeMKV: reading the disc (this takes a minute) …", 60000)
-                titles = makemkv.titles()
-                mkLog("titles: " + titles.joinToString(" | "))
-                if (titles.isNotEmpty()) mkTitles[key] = titles
-                js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
+            if (mkReload) {
+                mkReload = false
+                say("The disc is ejected and loaded again …", 60000)
+                makemkv.ejectAndReload()
             }
-            if (mkKey != key) return
-            val t = (if (which == "main") titles.maxByOrNull { it.durationMs } else titles.firstOrNull { it.id.toString() == which })
-            if (t == null) { say("MakeMKV found no title on this disc (see makemkv-log.txt).", 10000); stopMakeMkv(); return }
-            say("MakeMKV: starting ${t.name} (${t.durationMs / 60000} min) …", 60000)
-            val pipe = PipeStream(makemkv.stream(t)) { mkLog(it) }
-            mkPipe = pipe
-            val t0 = System.currentTimeMillis()
-            if (!pipe.awaitStart()) { say("MakeMKV stopped before the film began (see makemkv-log.txt).", 10000); stopMakeMkv(); return }
-            mkLog("first bytes after ${System.currentTimeMillis() - t0} ms")
-            if (mkKey != key) return
-            main.post { open(uri, false, null) }
+            for (attempt in 1..2) {
+                if (mkKey != key) return
+                if (mkAttempt(key, which, uri)) return
+                if (!makemkv.driveStuck || mkKey != key) { stopMakeMkv(); return }
+                // the drive answers reads with timeouts: the disc out and in once; then it is the user's turn
+                if (attempt == 1) {
+                    mkLog("drive stuck: eject and reload")
+                    say("The drive stopped answering: the disc is ejected and loaded again …", 60000)
+                    mkPipe?.close(); mkPipe = null
+                    if (!makemkv.ejectAndReload()) break
+                }
+            }
+            mkLog("drive still stuck: the user is asked to switch it off and on")
+            say("The drive still does not answer. Switch the drive off and on again, then start the film again.", 30000)
+            stopMakeMkv()
         } catch (e: Exception) {
             mkLog("failed: ${android.util.Log.getStackTraceString(e)}")
             say("MakeMKV: $e")
             stopMakeMkv()
         }
+    }
+
+    /** One try: the titles, then the stream; true when the player got it (or nothing more is to be done). */
+    private fun mkAttempt(key: String, which: String, uri: Uri): Boolean {
+        var titles = mkTitles[key]
+        if (titles == null) {
+            say("MakeMKV: reading the disc (this takes a minute) …", 60000)
+            titles = makemkv.titles()
+            if (makemkv.driveStuck) return false
+            mkLog("titles: " + titles.joinToString(" | "))
+            if (titles.isNotEmpty()) mkTitles[key] = titles
+            js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
+        }
+        if (mkKey != key) return true
+        val t = (if (which == "main") titles.maxByOrNull { it.durationMs } else titles.firstOrNull { it.id.toString() == which })
+        if (t == null) { say("MakeMKV found no title on this disc (see makemkv-log.txt).", 10000); stopMakeMkv(); return true }
+        say("MakeMKV: starting ${t.name} (${t.durationMs / 60000} min) …", 60000)
+        val pipe = PipeStream(makemkv.stream(t)) { mkLog(it) }
+        mkPipe = pipe
+        val t0 = System.currentTimeMillis()
+        if (!pipe.awaitStart()) {
+            if (makemkv.driveStuck) return false
+            say("MakeMKV stopped before the film began (see makemkv-log.txt).", 10000); stopMakeMkv(); return true
+        }
+        mkLog("first bytes after ${System.currentTimeMillis() - t0} ms")
+        if (mkKey != key) return true
+        main.post { open(uri, false, null) }
+        return true
     }
 
     private fun stopMakeMkv() {

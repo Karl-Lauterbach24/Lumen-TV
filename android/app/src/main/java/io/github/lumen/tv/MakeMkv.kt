@@ -231,14 +231,84 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         return Triple(String(d, 8, 8, Charsets.ISO_8859_1), String(d, 16, 16, Charsets.ISO_8859_1), String(d, 32, 4, Charsets.ISO_8859_1))
     }
 
+    /** One SCSI command over Bulk-Only from the app itself (makemkvcon must not be running); the CSW status or -1. */
+    private fun scsi(cdb: ByteArray, inLen: Int = 0, timeout: Int = 10000): Pair<Int, ByteArray> {
+        val c = conn ?: return -1 to ByteArray(0)
+        val cbw = java.nio.ByteBuffer.allocate(31).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        cbw.putInt(0x43425355).putInt(0x7100 + (tag++ and 0xff)).putInt(inLen).put(if (inLen > 0) 0x80.toByte() else 0).put(0).put(cdb.size.toByte())
+        cbw.put(cdb)
+        if (c.bulkTransfer(epOut, cbw.array(), 31, 5000) != 31) { resetRecovery(); return -1 to ByteArray(0) }
+        val d = ByteArray(inLen)
+        if (inLen > 0 && c.bulkTransfer(epIn, d, inLen, timeout) < 0) clearHalt(epIn!!)
+        val csw = ByteArray(13)
+        var n = c.bulkTransfer(epIn, csw, 13, timeout)
+        if (n != 13) { clearHalt(epIn!!); n = c.bulkTransfer(epIn, csw, 13, timeout) }
+        if (n != 13 || csw[0] != 'U'.code.toByte() || csw[3] != 'S'.code.toByte()) { resetRecovery(); return -1 to d }
+        return csw[12].toInt() to d
+    }
+    private var tag = 0
+
+    private fun clearHalt(ep: UsbEndpoint) { conn?.controlTransfer(0x02, 0x01, 0, ep.address, null, 0, 5000) }
+
+    private fun resetRecovery() {
+        val c = conn ?: return
+        c.controlTransfer(0x21, 0xff, 0, 0, null, 0, 5000)
+        epIn?.let { clearHalt(it) }; epOut?.let { clearHalt(it) }
+    }
+
+    private fun sense(): String {
+        val (st, d) = scsi(byteArrayOf(0x03, 0, 0, 0, 18, 0), 18, 5000)
+        return if (st == 0) "%x/%02x/%02x".format(d[2].toInt() and 0x0f, d[12].toInt() and 0xff, d[13].toInt() and 0xff) else "none ($st)"
+    }
+
+    /**
+     * What helps a drive that answers reads with "TIMEOUT ON LOGICAL UNIT": the disc out and in again.
+     * True when the drive is ready again afterwards.
+     */
+    fun ejectAndReload(): Boolean {
+        proc?.let { it.destroy(); it.waitFor(10, java.util.concurrent.TimeUnit.SECONDS) }
+        proc = null
+        Thread.sleep(500)
+        log("drive: unlocking the tray: " + scsi(byteArrayOf(0x1e, 0, 0, 0, 0, 0)).first)
+        val ej = scsi(byteArrayOf(0x1b, 0, 0, 0, 0x02, 0), 0, 30000).first
+        log("drive: eject: $ej" + if (ej != 0) ", sense ${sense()}" else "")
+        Thread.sleep(3000)
+        val ld = scsi(byteArrayOf(0x1b, 0, 0, 0, 0x03, 0), 0, 30000).first
+        log("drive: load: $ld" + if (ld != 0) ", sense ${sense()}" else "")
+        val until = System.currentTimeMillis() + 90_000
+        var last = ""
+        while (System.currentTimeMillis() < until) {
+            val st = scsi(byteArrayOf(0, 0, 0, 0, 0, 0)).first
+            if (st == 0) { log("drive: ready again after the reload"); return true }
+            val sn = sense()
+            if (sn != last) { log("drive: not ready: $st, sense $sn"); last = sn }
+            Thread.sleep(1000)
+        }
+        log("drive: not ready 90 s after the reload")
+        return false
+    }
+
     // ---------------------------------------------------------------- running makemkvcon
 
     @Volatile private var proc: Process? = null
+    /** The drive answered reads with timeouts (makemkvcon was stopped): see [ejectAndReload]. */
+    @Volatile var driveStuck = false
+        private set
+    /** Called (on makemkvcon's output thread) when the drive got stuck. */
+    var onStuck: (() -> Unit)? = null
 
     private fun pipeOutput(p: Process, onLine: (String) -> Unit = {}) {
         var prg = 0
+        var timeouts = 0
+        driveStuck = false
         p.inputStream.bufferedReader().forEachLine { l ->
             onLine(l)
+            if (l.startsWith("MSG:2003") && l.contains("TIMEOUT ON LOGICAL UNIT") && ++timeouts == 3) {
+                log("drive: 3 read timeouts: makemkvcon is stopped")
+                driveStuck = true
+                p.destroy()
+                onStuck?.invoke()
+            }
             when {
                 l.startsWith("PRGV") || l.startsWith("PRGC") || l.startsWith("PRGT") -> if (prg++ % 50 == 0) log(l)
                 l.startsWith("MSG:3025") || l.startsWith("MSG:3307") || l.startsWith("MSG:3309") -> { }   // (title list details)
