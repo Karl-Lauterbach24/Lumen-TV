@@ -120,7 +120,7 @@ class MainActivity : Activity() {
         // MakeMKV's stream comes in bursts: a longer one, but held to 32 MB (MakeMKV needs the memory of a small television)
         val load = androidx.media3.exoplayer.DefaultLoadControl.Builder()
             .apply {
-                if (long) setBufferDurationsMs(6000, 15000, 2500, 4000).setTargetBufferBytes(16 shl 20).setPrioritizeTimeOverSizeThresholds(false)
+                if (long) setBufferDurationsMs(6000, 15000, 2500, 4000).setTargetBufferBytes(12 shl 20).setPrioritizeTimeOverSizeThresholds(false)
                 else setBufferDurationsMs(2000, 4000, 800, 1500)
             }.build()
         val p = ExoPlayer.Builder(this, factory).setLoadControl(load).build()

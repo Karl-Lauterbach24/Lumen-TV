@@ -29,6 +29,7 @@
 #include <dirent.h>
 #include <time.h>
 #include <linux/usbdevice_fs.h>
+#include <poll.h>
 
 #define SOCKET_NAME "lumen.mmshim.usb"
 #define CHUNK (64 * 1024)
@@ -103,10 +104,36 @@ static int connect_app(void)
     return 0;
 }
 
+/*
+ * One bulk transfer. As an asynchronous URB (submit, poll, reap) unless MMSHIM_URB=0: on the television the
+ * synchronous USBDEVFS_BULK kept a core busy in the kernel for as long as the drive took to answer.
+ */
+static int use_urb = -1;
 static int bulk(int ep, void *data, unsigned len, unsigned timeout_ms)
 {
-    struct usbdevfs_bulktransfer b = { ep, len, timeout_ms, data };
-    return real_ioctl(usb_fd, USBDEVFS_BULK, &b);
+    if (use_urb < 0) { const char *e = getenv("MMSHIM_URB"); use_urb = !(e && *e == '0'); LOG("bulk transfers: %s", use_urb ? "URB" : "USBDEVFS_BULK"); }
+    if (!use_urb) {
+        struct usbdevfs_bulktransfer b = { ep, len, timeout_ms, data };
+        return real_ioctl(usb_fd, USBDEVFS_BULK, &b);
+    }
+    struct usbdevfs_urb u;
+    memset(&u, 0, sizeof(u));
+    u.type = USBDEVFS_URB_TYPE_BULK;
+    u.endpoint = ep;
+    u.buffer = data;
+    u.buffer_length = len;
+    if (real_ioctl(usb_fd, USBDEVFS_SUBMITURB, &u) < 0) return -1;
+    struct pollfd p = { usb_fd, POLLOUT | POLLWRNORM, 0 };
+    int r;
+    do r = poll(&p, 1, timeout_ms); while (r < 0 && errno == EINTR);
+    if (r <= 0) real_ioctl(usb_fd, USBDEVFS_DISCARDURB, &u);
+    struct usbdevfs_urb *got = NULL;
+    int k;
+    do k = real_ioctl(usb_fd, USBDEVFS_REAPURB, &got); while (k < 0 && errno == EINTR);
+    if (k < 0) return -1;
+    if (r <= 0) { errno = ETIMEDOUT; return -1; }
+    if (u.status < 0) { errno = -u.status; return -1; }
+    return u.actual_length;
 }
 
 static void clear_halt(int ep)

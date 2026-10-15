@@ -189,8 +189,10 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     fun clearCache() { cacheDir.listFiles()?.forEach { it.delete() } }
 
     /**
-     * Memory where the television has plenty (a quarter of what is free, up to 512 MB); otherwise the
-     * television's storage (what is free beyond 300 MB, up to 1 GB); the user's choice of place and size first.
+     * Automatic: memory, a fifth of what is free (32 to 512 MB). The storage only where memory is short and
+     * the storage is fast enough: measured on a small television (929 MB, swapping onto its eMMC), a cache on
+     * its storage stalled the picture for a minute, while 48 MB of memory were enough once the drive reads
+     * at 10+ MB/s. The user's choice of place and size first.
      */
     fun cachePlan(): CachePlan {
         val am = activity.getSystemService(android.app.ActivityManager::class.java)
@@ -199,13 +201,14 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         val freeDisk = cacheDir.usableSpace
         val mb = 1L shl 20
         fun round(b: Long) = (b / (16 * mb)) * 16 * mb
-        val ramAuto = round((mi.availMem / 4).coerceIn(32 * mb, 512 * mb))
+        // (a television with about 1 GB has no memory to spare: MakeMKV, the player and the page need it)
+        val ramAuto = if (mi.totalMem < 1536 * mb) 32 * mb else round((mi.availMem / 5).coerceIn(32 * mb, 512 * mb))
         val diskAuto = round((freeDisk - 300 * mb).coerceIn(0, 1024 * mb))
         val bigRam = mi.totalMem >= 2560 * mb && !mi.lowMemory
         val mode = when (cacheMode) {
             "ram" -> "ram"
             "storage" -> if (diskAuto >= 64 * mb || (cacheMb > 0 && freeDisk - cacheMb * mb > 100 * mb)) "storage" else "ram"
-            else -> if (bigRam || diskAuto < 128 * mb) "ram" else "storage"
+            else -> if (bigRam || mi.availMem >= 160 * mb || diskAuto < 128 * mb || isSwapping()) "ram" else "storage"
         }
         val why = "television: ${mi.totalMem / mb} MB memory (${mi.availMem / mb} free), ${freeDisk / mb} MB storage free; setting ${cacheMode}/${if (cacheMb > 0) "$cacheMb MB" else "auto"}"
         return if (mode == "ram") {
@@ -216,6 +219,12 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
             CachePlan(File(cacheDir, "stream.cache"), want.coerceAtLeast(32 * mb), why)
         }
     }
+
+    /** The television swaps (its storage is then busy enough) */
+    private fun isSwapping(): Boolean = try {
+        val m = File("/proc/meminfo").readLines().associate { l -> l.substringBefore(':') to (l.substringAfter(':').trim().substringBefore(' ').toLongOrNull() ?: 0) }
+        (m["SwapTotal"] ?: 0) - (m["SwapFree"] ?: 0) > 64 * 1024
+    } catch (_: Exception) { false }
 
     // ---------------------------------------------------------------- the drive
 
@@ -442,10 +451,23 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         return fifo
     }
 
-    /** makemkvcon's own process (a child of proot): its pid, from /proc. */
-    private fun makemkvconPid(): Int = File("/proc").listFiles().orEmpty().mapNotNull { it.name.toIntOrNull() }.firstOrNull { pid ->
-        try { File("/proc/$pid/cmdline").readText().contains("/usr/bin/makemkvcon") && !File("/proc/$pid/cmdline").readText().startsWith(nativeDir) } catch (_: Exception) { false }
-    } ?: -1
+    /**
+     * makemkvcon's own process: a child of proot, so a little above proot's pid. (Not by listing /proc: this
+     * television has an entry there whose name is not valid UTF-8, and listing it aborts a debug build.)
+     */
+    @Volatile private var mkPid = -1
+    private fun makemkvconPid(): Int {
+        val known = mkPid
+        if (known > 0 && cmdline(known).contains("/usr/bin/makemkvcon")) return known
+        val base = proc?.let { pidOf(it) } ?: return -1
+        if (base <= 0) return -1
+        for (pid in base + 1..base + 400) {
+            val c = cmdline(pid)
+            if (c.contains("/usr/bin/makemkvcon") && !c.startsWith(nativeDir)) { mkPid = pid; return pid }
+        }
+        return -1
+    }
+    private fun cmdline(pid: Int) = try { File("/proc/$pid/cmdline").readText() } catch (_: Exception) { "" }
 
     /**
      * Holds makemkvcon while the cache is full: waiting for room it keeps a core busy in the kernel, which
@@ -497,6 +519,9 @@ class PipeDataSource(private val pipe: PipeStream) : androidx.media3.datasource.
  * drive deliver, so a drive that pauses for a few seconds is not seen by the player. A quarter of the ring
  * keeps what was played (the player may go back that far); the rest is read ahead.
  */
+private const val HEAD_START = 48L shl 20
+private const val STORAGE_RATE = 4L shl 20
+
 class PipeStream(private val fifo: File, private val capacity: Long, private val file: File?, private val stats: (String) -> Unit,
                  private val hold: (Boolean) -> Unit = {}) {
     private val lock = Object()
@@ -513,6 +538,9 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
     private var minAhead = Long.MAX_VALUE
 
     fun ahead(): Long = written - position
+    private var started = false
+    private var fillT0 = System.currentTimeMillis()
+    private var fillB0 = 0L
     private var holds = 0
     private fun limit() = position - keepBehind.coerceAtMost(position) + capacity
 
@@ -542,6 +570,15 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
                     }
                 }
                 if (held) hold(false)
+                // on storage: no faster than the flash can write beside the player's reading (and the
+                // television's swapping), and only a head start until the player has begun
+                if (file != null) {
+                    synchronized(lock) { while (!closed && !started && written >= HEAD_START) lock.wait(200) }
+                    val due = fillT0 + (written - fillB0) * 1000 / STORAGE_RATE
+                    val now = System.currentTimeMillis()
+                    if (due > now) Thread.sleep(minOf(due - now, 1000))
+                    if (now - fillT0 > 10_000) { fillT0 = now; fillB0 = written }
+                }
                 if (closed) break
                 val n = i.read(buf)
                 if (n < 0) break
@@ -588,7 +625,12 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
             if (closed || position >= written) return -1
         }
         val n = get(position, b, off, minOf(len.toLong(), written - position).toInt())
-        synchronized(lock) { position += n; minAhead = minOf(minAhead, written - position); lock.notifyAll() }
+        synchronized(lock) {
+            position += n
+            if (!started && position > 1_000_000) started = true
+            minAhead = minOf(minAhead, written - position)
+            lock.notifyAll()
+        }
         val now = System.currentTimeMillis()
         if (now - tl >= 5000) {
             stats("stream: played %.1f MB, cache %s %.0f MB ahead (least %.0f MB), MakeMKV held %d×, in %.2f MB/s, out %.2f MB/s".format(java.util.Locale.ROOT,
