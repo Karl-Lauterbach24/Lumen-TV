@@ -113,17 +113,20 @@ class MainActivity : Activity() {
     private fun ensurePlayer(long: Boolean = false): ExoPlayer {
         player?.let { if (playerLong == long) return it; it.release(); player = null }
         playerLong = long
+        // the television's own decoders first; what it cannot decode (DTS, TrueHD, often Dolby) the app's FFmpeg does
         val factory = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
         // a short look-ahead: the menu of a disc runs ahead of the picture by what the player has buffered;
         // MakeMKV's stream comes in bursts: a longer one, but held to 32 MB (MakeMKV needs the memory of a small television)
         val load = androidx.media3.exoplayer.DefaultLoadControl.Builder()
             .apply {
-                if (long) setBufferDurationsMs(10000, 30000, 4000, 6000).setTargetBufferBytes(32 shl 20).setPrioritizeTimeOverSizeThresholds(false)
+                if (long) setBufferDurationsMs(10000, 30000, 4000, 6000).setTargetBufferBytes(24 shl 20).setPrioritizeTimeOverSizeThresholds(false)
                 else setBufferDurationsMs(2000, 4000, 800, 1500)
             }.build()
         val p = ExoPlayer.Builder(this, factory).setLoadControl(load).build()
         p.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
+                if (mkKey != null) mkLog("player: state ${when (state) { Player.STATE_BUFFERING -> "buffering"; Player.STATE_READY -> "ready"; Player.STATE_ENDED -> "ended"; else -> "idle" }} at ${p.currentPosition / 1000} s, buffered to ${p.bufferedPosition / 1000} s")
                 when (state) {
                     Player.STATE_BUFFERING -> event("waiting")
                     Player.STATE_READY -> event(if (p.playWhenReady) "playing" else "pause")
@@ -154,6 +157,23 @@ class MainActivity : Activity() {
                 // (after the page's own "does not play" message, which it shows at once)
                 main.postDelayed({ js("window.lumenToast&&window.lumenToast(${JSONObject.quote(why)},20000)") }, 500)
             }
+        })
+        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
+            .setPreferredAudioLanguages(java.util.Locale.getDefault().language).build()
+        p.addAnalyticsListener(object : androidx.media3.exoplayer.analytics.AnalyticsListener {
+            override fun onDroppedVideoFrames(t: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, dropped: Int, ms: Long) {
+                if (mkKey != null) mkLog("player: $dropped frames dropped in $ms ms at ${t.currentPlaybackPositionMs / 1000} s")
+            }
+            override fun onTracksChanged(t: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, tracks: androidx.media3.common.Tracks) {
+                if (mkKey == null) return
+                for (g in tracks.groups) for (i in 0 until g.length) {
+                    val f = g.getTrackFormat(i)
+                    mkLog("track: ${f.sampleMimeType} ${f.language ?: ""} ${f.label ?: ""} ${if (f.channelCount > 0) "${f.channelCount}ch" else ""}${if (f.width > 0) "${f.width}x${f.height}" else ""} " +
+                        "supported=${androidx.media3.common.C.getFormatSupportString(g.getTrackSupport(i))} selected=${g.isTrackSelected(i)}")
+                }
+            }
+            override fun onAudioCodecError(t: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, e: Exception) { if (mkKey != null) mkLog("player: audio codec error $e") }
+            override fun onAudioSinkError(t: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, e: Exception) { if (mkKey != null) mkLog("player: audio sink error $e") }
         })
         playerView.player = p
         player = p
@@ -311,6 +331,60 @@ class MainActivity : Activity() {
         main.removeCallbacks(tick)
         player?.let { it.stop(); it.clearMediaItems() }
         playerView.visibility = View.INVISIBLE
+    }
+
+    // ---- audio and subtitle tracks ----
+    private fun trackLabel(f: androidx.media3.common.Format): String {
+        val lang = f.language?.takeIf { it.isNotEmpty() && it != "und" }?.let { java.util.Locale.forLanguageTag(it).getDisplayLanguage(java.util.Locale.getDefault()) }
+            ?.replaceFirstChar { it.titlecase(java.util.Locale.getDefault()) }
+        val mime = if (f.sampleMimeType == MimeTypes.APPLICATION_MEDIA3_CUES) f.codecs ?: "" else f.sampleMimeType ?: ""
+        val codec = when (mime) {
+            MimeTypes.AUDIO_DTS -> "DTS"; MimeTypes.AUDIO_DTS_HD, MimeTypes.AUDIO_DTS_EXPRESS -> "DTS-HD"
+            MimeTypes.AUDIO_AC3 -> "Dolby Digital"; MimeTypes.AUDIO_E_AC3, MimeTypes.AUDIO_E_AC3_JOC -> "Dolby Digital Plus"
+            MimeTypes.AUDIO_TRUEHD -> "Dolby TrueHD"; MimeTypes.AUDIO_AAC -> "AAC"; MimeTypes.AUDIO_RAW -> "PCM"
+            MimeTypes.AUDIO_FLAC -> "FLAC"; MimeTypes.AUDIO_MPEG -> "MP3"; MimeTypes.AUDIO_OPUS -> "Opus"
+            MimeTypes.APPLICATION_PGS -> "PGS"; MimeTypes.APPLICATION_VOBSUB -> "VobSub"; MimeTypes.TEXT_SSA -> "SSA"
+            MimeTypes.APPLICATION_SUBRIP -> "SRT"
+            else -> ""
+        }
+        val ch = when (f.channelCount) { 1 -> "Mono"; 2 -> "Stereo"; 6 -> "5.1"; 7 -> "6.1"; 8 -> "7.1"; else -> if (f.channelCount > 0) "${f.channelCount} ch" else "" }
+        val parts = listOfNotNull(lang ?: f.label, codec.ifEmpty { null }, ch.ifEmpty { null })
+        // MakeMKV names its tracks ("Surround 5.1", "Stereo"): only a name that says more is kept
+        val name = f.label?.takeIf { l -> lang != null && parts.none { l.contains(it, true) } && !Regex("(?i)^(surround|stereo|mono)").containsMatchIn(l) }
+        return (parts + listOfNotNull(name)).joinToString(" · ").ifEmpty { "?" }
+    }
+
+    private fun tracksJson(): String {
+        val a = org.json.JSONArray()
+        val p = player ?: return a.toString()
+        val textOff = p.trackSelectionParameters.disabledTrackTypes.contains(androidx.media3.common.C.TRACK_TYPE_TEXT)
+        p.currentTracks.groups.forEachIndexed { gi, g ->
+            val type = when (g.type) { androidx.media3.common.C.TRACK_TYPE_AUDIO -> "audio"; androidx.media3.common.C.TRACK_TYPE_TEXT -> "text"; else -> return@forEachIndexed }
+            for (i in 0 until g.length) {
+                val f = g.getTrackFormat(i)
+                a.put(JSONObject().put("type", type).put("id", "$gi:$i").put("label", trackLabel(f))
+                    .put("selected", g.isTrackSelected(i) && !(type == "text" && textOff))
+                    .put("ok", g.isTrackSupported(i))
+                    .put("forced", f.selectionFlags and androidx.media3.common.C.SELECTION_FLAG_FORCED != 0))
+            }
+        }
+        return a.toString()
+    }
+
+    private fun selectTrack(type: String, which: String) {
+        val p = player ?: return
+        val kind = if (type == "audio") androidx.media3.common.C.TRACK_TYPE_AUDIO else androidx.media3.common.C.TRACK_TYPE_TEXT
+        val b = p.trackSelectionParameters.buildUpon()
+        if (which == "off") b.setTrackTypeDisabled(kind, true)
+        else {
+            val gi = which.substringBefore(':').toIntOrNull() ?: return
+            val ti = which.substringAfter(':').toIntOrNull() ?: return
+            val g = p.currentTracks.groups.getOrNull(gi) ?: return
+            if (ti >= g.length) return
+            b.setTrackTypeDisabled(kind, false).setOverrideForType(androidx.media3.common.TrackSelectionOverride(g.mediaTrackGroup, ti))
+        }
+        p.trackSelectionParameters = b.build()
+        if (mkKey != null) mkLog("player: $type track $which chosen")
     }
 
     // ---- MakeMKV (test build) ----
@@ -557,6 +631,11 @@ class MainActivity : Activity() {
                 reply(id, "[]")
             }
         }
+        /** The audio and subtitle tracks of what plays: [{type, id, label, selected, ok, forced}]. */
+        @JavascriptInterface fun tracks(id: Int) { main.post { reply(id, tracksJson()) } }
+        /** Chooses a track ([which] as from [tracks], or "off" for no subtitles). */
+        @JavascriptInterface fun track(type: String, which: String) { main.post { selectTrack(type, which) } }
+
         @JavascriptInterface fun drives(id: Int) { drives.list { json -> reply(id, json) } }
         @JavascriptInterface fun folder(id: Int, path: String) { drives.folder(path) { json -> reply(id, json) } }
 

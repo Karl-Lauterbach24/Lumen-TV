@@ -85,6 +85,9 @@
       detach: function (video) { release(video); },
       // an action of a disc ("copy"): messages arrive as toasts
       act: function (path, done) { ask('act', path, function () { done(); }); },
+      // the audio and subtitle tracks of what plays, and choosing one ("off": no subtitles)
+      tracks: function (done) { ask('tracks', undefined, done); },
+      track: function (type, id) { N.track(type, id); },
       watch: function (cb) { window.__lumenDrivesChanged = cb; }
     },
 

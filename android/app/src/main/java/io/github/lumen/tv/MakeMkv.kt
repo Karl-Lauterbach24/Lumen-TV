@@ -36,6 +36,8 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     private val prefs = activity.getSharedPreferences("makemkv", Activity.MODE_PRIVATE)
     private val usb = activity.getSystemService(UsbManager::class.java)
 
+    companion object { var READ_BUFFER_MB = 16 }
+
     class Title(val id: Int, val name: String, val durationMs: Long, val size: String, val file: String) {
         override fun toString() = "#$id $name ${durationMs / 60000} min $size"
     }
@@ -119,11 +121,14 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     private val keyPage = "https://forum.makemkv.com/forum/viewtopic.php?f=5&t=1053"
     val keyMode: String get() = prefs.getString("mode", "") ?: ""
 
-    private fun writeKey(key: String) {
+    private fun writeKey(key: String) = setting("app_Key", key)
+
+    /** One line of MakeMKV's settings.conf (the others stay). */
+    @Synchronized private fun setting(name: String, value: String) {
         val f = File(root, "root/.MakeMKV/settings.conf")
         f.parentFile?.mkdirs()
-        val keep = if (f.exists()) f.readLines().filter { !it.trimStart().startsWith("app_Key") } else emptyList()
-        f.writeText((keep + "app_Key = \"$key\"").joinToString("\n") + "\n")
+        val keep = if (f.exists()) f.readLines().filter { it.substringBefore('=').trim() != name } else emptyList()
+        f.writeText((keep + "$name = \"$value\"").joinToString("\n") + "\n")
     }
 
     fun setOwnKey(key: String) {
@@ -358,7 +363,9 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         val out = File(root, "tmp/out"); out.deleteRecursively(); out.mkdirs()
         val fifo = File(out, t.file)
         android.system.Os.mkfifo(fifo.absolutePath, 0x1b6)
-        val p = command(listOf("-r", "--cache=32", "mkv", "disc:0", t.id.toString(), "/tmp/out"),
+        // a small read buffer: the television has little memory, and swapping makes the picture stutter
+        setting("io_RBufSizeMB", READ_BUFFER_MB.toString())
+        val p = command(listOf("-r", "--cache=$READ_BUFFER_MB", "mkv", "disc:0", t.id.toString(), "/tmp/out"),
             mapOf("MMSHIM_STREAM" to "/tmp/out/", "MMSHIM_DURATION_MS" to t.durationMs.toString())).start()
         proc = p
         kotlin.concurrent.thread(isDaemon = true) {
@@ -367,7 +374,8 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
                 try {
                     val mi = File("/proc/meminfo").readLines().associate { l -> l.substringBefore(':') to (l.substringAfter(':').trim().substringBefore(' ').toLongOrNull() ?: 0) }
                     val rt = Runtime.getRuntime()
-                    log("memory: available ${mi["MemAvailable"]?.div(1024)} MB, free ${mi["MemFree"]?.div(1024)} MB, app heap ${(rt.totalMemory() - rt.freeMemory()) shr 20} MB, native ${android.os.Debug.getNativeHeapAllocatedSize() shr 20} MB")
+                    val rss = try { File("/proc/${pidOf(p)}/status").readLines().firstOrNull { it.startsWith("VmRSS") }?.substringAfter(':')?.trim() } catch (_: Exception) { null }
+                    log("memory: available ${mi["MemAvailable"]?.div(1024)} MB, swap free ${mi["SwapFree"]?.div(1024)} MB, proot ${rss ?: "?"}, app heap ${(rt.totalMemory() - rt.freeMemory()) shr 20} MB, native ${android.os.Debug.getNativeHeapAllocatedSize() shr 20} MB")
                 } catch (_: Exception) { }
                 Thread.sleep(15000)
             }
@@ -384,6 +392,10 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         log("streaming $t")
         return fifo
     }
+
+    private fun pidOf(p: Process): Int = try {
+        p.javaClass.getDeclaredField("pid").apply { isAccessible = true }.getInt(p)
+    } catch (_: Exception) { -1 }
 
     fun stop() {
         proc?.destroy(); proc = null

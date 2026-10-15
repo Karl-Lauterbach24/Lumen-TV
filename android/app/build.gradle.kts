@@ -21,8 +21,8 @@ android {
         (project.findProperty("abis") as String?)?.let { ndk { abiFilters += it.split(",") } }
     }
     buildTypes {
-        // the MakeMKV test build installs beside the released app (own name, own data)
-        debug {
+        // -Pmkvtest: a test build that installs beside the released app (own name, own data)
+        if (project.hasProperty("mkvtest")) getByName("debug") {
             applicationIdSuffix = ".mkvtest"
             versionNameSuffix = "-mkvtest"
         }
@@ -59,6 +59,7 @@ val receiverAssets = tasks.register<Copy>("receiverAssets") {
     doFirst { if (!receiverDir.isDirectory) throw GradleException("Lumen's receiver folder not found: $receiverDir (see lumen.receiver)") }
 }
 android.sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/receiver"))
+if (project.hasProperty("mkvtest")) android.sourceSets.getByName("debug").res.srcDir("src/mkvtest-res")
 tasks.named("preBuild") { dependsOn(receiverAssets) }
 
 dependencies {
@@ -66,6 +67,8 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:1.5.1")
     implementation("androidx.media3:media3-ui:1.5.1")
     implementation("androidx.webkit:webkit:1.12.1")
+    // Dolby, DTS and TrueHD decoded by the app (see libs/README.md)
+    implementation(files("libs/media3-decoder-ffmpeg-1.5.1.aar"))
     implementation("org.apache.commons:commons-compress:1.26.1")
     testImplementation("junit:junit:4.13.2")
 }
