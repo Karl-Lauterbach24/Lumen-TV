@@ -42,9 +42,11 @@ object EpisodeGuide {
                 val start = wanted.coerceAtMost(inSeason.size - k)
                 val pick = inSeason.subList(start, start + k)
                 // how far the lengths are off (TVmaze gives the slot, a disc the real running time)
-                val off = pick.indices.sumOf { j -> kotlin.math.abs(pick[j].minutes - minutes[j]).toDouble() } / k
-                    // a season too short for this disc number (e.g. the 2023 "Doctor Who" with 8 episodes for disc 3) counts against it
-                    .plus(if (start != wanted) 10.0 else 0.0)
+                var off = pick.indices.sumOf { j -> kotlin.math.abs(pick[j].minutes - minutes[j]).toDouble() } / k
+                // a season too short for this disc number (e.g. the 2023 "Doctor Who" with 8 episodes for disc 3) counts against it,
+                // and so does another name ("Doctor Who Confidential" has the same lengths)
+                if (start != wanted) off += 10
+                if (!show.optString("name").equals(series.trim(), ignoreCase = true)) off += 3
                 log("TVmaze: ${show.optString("name")} (${show.optString("premiered")}) season $season: ${inSeason.size} episodes, lengths off by %.0f min".format(java.util.Locale.ROOT, off))
                 if (best == null || off < best.first)
                     best = off to Result(show.optString("name"), show.optString("premiered"), pick, discNo > 0)

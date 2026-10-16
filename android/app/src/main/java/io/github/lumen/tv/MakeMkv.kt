@@ -410,21 +410,24 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         var prg = 0
         var timeouts = 0
         driveStuck = false
-        p.inputStream.bufferedReader().forEachLine { l ->
-            onLine(l)
-            if (l.startsWith("MSG:2003") && l.contains("TIMEOUT ON LOGICAL UNIT") && ++timeouts == 3) {
-                log("drive: 3 read timeouts: makemkvcon is stopped")
-                driveStuck = true
-                p.destroy()
-                onStuck?.invoke()
+        // (stopping makemkvcon interrupts the read: that ends the output, it is no error)
+        try {
+            p.inputStream.bufferedReader().forEachLine { l ->
+                onLine(l)
+                if (l.startsWith("MSG:2003") && l.contains("TIMEOUT ON LOGICAL UNIT") && ++timeouts == 3) {
+                    log("drive: 3 read timeouts: makemkvcon is stopped")
+                    driveStuck = true
+                    p.destroy()
+                    onStuck?.invoke()
+                }
+                when {
+                    l.startsWith("PRGV") || l.startsWith("PRGC") || l.startsWith("PRGT") -> if (prg++ % 50 == 0) log(l)
+                    l.startsWith("MSG:3025") || l.startsWith("MSG:3307") || l.startsWith("MSG:3309") -> { }   // (title list details)
+                    l.startsWith("TINFO") || l.startsWith("SINFO") || l.startsWith("CINFO") || l.startsWith("DRV:") && l.contains(",256,") -> { }
+                    else -> log(l.take(200))
+                }
             }
-            when {
-                l.startsWith("PRGV") || l.startsWith("PRGC") || l.startsWith("PRGT") -> if (prg++ % 50 == 0) log(l)
-                l.startsWith("MSG:3025") || l.startsWith("MSG:3307") || l.startsWith("MSG:3309") -> { }   // (title list details)
-                l.startsWith("TINFO") || l.startsWith("SINFO") || l.startsWith("CINFO") || l.startsWith("DRV:") && l.contains(",256,") -> { }
-                else -> log(l.take(200))
-            }
-        }
+        } catch (_: java.io.IOException) { }
     }
 
     /** MakeMKV's CINFO of the last disc read: 2 = name, 32 = volume name. */
