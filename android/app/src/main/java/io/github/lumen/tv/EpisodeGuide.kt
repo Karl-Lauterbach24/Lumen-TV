@@ -10,7 +10,9 @@ import java.net.URLEncoder
  * Names the episodes of a series disc with TVmaze (api.tvmaze.com: free, no key). Only the series name from
  * the disc is sent. Of the shows the search finds, the one whose season has episodes as long as the disc's
  * titles is taken (so "Doctor Who" of 2005 with 45 minutes, not the one of 1963 with 25). Which episodes a disc
- * holds is a guess from its number: disc n of a season with k episodes per disc holds episodes (n-1)·k+1 …
+ * holds is a guess from its number: a season of N episodes on discs of k has N / k discs, the episodes left over
+ * lie on the first discs (13 episodes, 3 per disc: 4 + 3 + 3 + 3, so disc 3 holds episodes 8–10). The user can
+ * shift the numbers ([shift]).
  */
 object EpisodeGuide {
     class Episode(val season: Int, val number: Int, val name: String, val minutes: Int)
@@ -24,7 +26,7 @@ object EpisodeGuide {
     }
 
     /** The episodes on the disc, in the order of [minutes] (the disc's episode titles), or null. */
-    fun lookup(series: String, season: Int, discNo: Int, minutes: List<Int>, log: (String) -> Unit): Result? {
+    fun lookup(series: String, season: Int, discNo: Int, minutes: List<Int>, shift: Int, log: (String) -> Unit): Result? {
         if (series.isBlank() || season <= 0 || minutes.isEmpty()) return null
         return try {
             val found = JSONArray(get("https://api.tvmaze.com/search/shows?q=" + URLEncoder.encode(series, "UTF-8")))
@@ -38,7 +40,9 @@ object EpisodeGuide {
                     .sortedBy { it.number }
                 if (inSeason.size < minutes.size) continue
                 val k = minutes.size
-                val wanted = if (discNo > 0) (discNo - 1) * k else 0
+                val discs = maxOf(1, inSeason.size / k)
+                val extra = inSeason.size - discs * k
+                val wanted = if (discNo > 0) (discNo - 1) * k + minOf(discNo - 1, maxOf(0, extra)) else 0
                 val start = wanted.coerceAtMost(inSeason.size - k)
                 val pick = inSeason.subList(start, start + k)
                 // how far the lengths are off (TVmaze gives the slot, a disc the real running time)
@@ -48,8 +52,10 @@ object EpisodeGuide {
                 if (start != wanted) off += 10
                 if (!show.optString("name").equals(series.trim(), ignoreCase = true)) off += 3
                 log("TVmaze: ${show.optString("name")} (${show.optString("premiered")}) season $season: ${inSeason.size} episodes, lengths off by %.0f min".format(java.util.Locale.ROOT, off))
-                if (best == null || off < best.first)
-                    best = off to Result(show.optString("name"), show.optString("premiered"), pick, discNo > 0)
+                if (best == null || off < best.first) {
+                    val from = (start + shift).coerceIn(0, inSeason.size - k)
+                    best = off to Result(show.optString("name"), show.optString("premiered"), inSeason.subList(from, from + k), discNo > 0)
+                }
             }
             best?.takeIf { it.first <= 12 }?.second
         } catch (e: Exception) {

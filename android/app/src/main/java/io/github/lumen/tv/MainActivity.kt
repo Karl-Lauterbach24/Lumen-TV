@@ -85,7 +85,7 @@ class MainActivity : Activity() {
             if ((mkPipe?.position ?: 0L) > 0L) {
                 mkReload = true
                 mkLog("drive stuck during the film")
-                say("The drive stopped answering during the film. Start it again (the disc is ejected and loaded again first).", 20000)
+                say(t("Das Laufwerk antwortet während des Films nicht mehr. Bitte neu starten (die Disc wird vorher aus- und eingezogen).", "The drive stopped answering during the film. Start it again (the disc is ejected and loaded again first)."), 20000)
             }
         }
 
@@ -415,6 +415,7 @@ class MainActivity : Activity() {
     }
 
     private fun say(msg: String, ms: Int = 7000) = js("window.lumenToast&&window.lumenToast(${JSONObject.quote(msg)},$ms)")
+    private fun t(de: String, en: String) = if (java.util.Locale.getDefault().language == "de") de else en
 
     private fun langName(code: String): String =
         java.util.Locale.forLanguageTag(code).getDisplayLanguage(java.util.Locale.getDefault()).replaceFirstChar { it.titlecase(java.util.Locale.getDefault()) }.ifEmpty { code }
@@ -454,6 +455,12 @@ class MainActivity : Activity() {
             action(t("Untertitel: ", "Subtitles: ") + when { sl == "off" -> t("aus", "off"); sl.isEmpty() || sl !in subs -> t("automatisch", "automatic"); else -> langName(sl) },
                 subs.joinToString(" · ") { langName(it) }.ifEmpty { t("keine auf der Disc", "none on the disc") }, "mksub", "language")
             if (d.kind == "episodes") d.all?.let { play(it, t("Alle Episoden hintereinander", "All episodes in a row"), "episodes") }
+            // the episode numbers are reckoned from the disc number: they can be shifted where the box is laid out otherwise
+            if (guide != null) {
+                val first = guide.episodes.first().number; val last = guide.episodes.last().number
+                action(t("Folgen $first–$last stimmen nicht? Eine weiter", "Episodes $first–$last wrong? One on"), t("die Folgennummern dieser Disc um eins erhöhen", "raise this disc's episode numbers by one"), "mkup", "episodes")
+                if (first > 1) action(t("Eine Folge zurück", "One episode back"), t("die Folgennummern dieser Disc um eins verringern", "lower this disc's episode numbers by one"), "mkdown", "episodes")
+            }
             d.extras.take(12).forEachIndexed { i, tt -> play(tt, "Extra ${i + 1}", "extra") }
         }
         val plan = try { makemkv.cachePlan() } catch (_: Exception) { null }
@@ -474,8 +481,8 @@ class MainActivity : Activity() {
             .setView(edit)
             .setPositiveButton("OK") { _, _ ->
                 val k = edit.text.toString().trim()
-                if (k.length < 20) say("That is not a MakeMKV key.")
-                else kotlin.concurrent.thread { makemkv.setOwnKey(k); say("MakeMKV: your key is entered."); js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()") }
+                if (k.length < 20) say(t("Das ist kein MakeMKV-Schlüssel.", "That is not a MakeMKV key."))
+                else kotlin.concurrent.thread { makemkv.setOwnKey(k); say(t("MakeMKV: dein Schlüssel ist eingetragen.", "MakeMKV: your key is entered.")); js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()") }
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -483,19 +490,19 @@ class MainActivity : Activity() {
 
     /** Reads the disc's titles with MakeMKV (no playing): the page then lists the film or the episodes. */
     private fun mkRead(key: String, say: (String) -> Unit) {
-        if (mkKey != null) { say("MakeMKV is busy."); return }
+        if (mkKey != null) { say(t("MakeMKV ist beschäftigt.", "MakeMKV is busy.")); return }
         mkLog("---- read titles of $key")
-        val device = discs.lend(key) ?: run { say("The drive is gone."); discs.giveBack(key); return }
+        val device = discs.lend(key) ?: run { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); discs.giveBack(key); return }
         mkKey = key
         try {
             if (!makemkv.openBridge(device) || !(makemkv.identify() || (makemkv.ejectAndReload() && makemkv.identify()))) {
-                say("The drive does not answer. Switch it off and on again."); return
+                say(t("Das Laufwerk antwortet nicht. Bitte aus- und wieder einschalten.", "The drive does not answer. Switch it off and on again.")); return
             }
             say(if (java.util.Locale.getDefault().language == "de") "MakeMKV liest die Disc …" else "MakeMKV reads the disc …")
             val titles = makemkv.titles()
             mkLog("titles: " + titles.joinToString(" | "))
             if (titles.isNotEmpty()) mkTitles[key] = titles
-            else say("MakeMKV found no titles (see makemkv-log.txt).")
+            else say(t("MakeMKV hat keine Titel gefunden (siehe makemkv-log.txt).", "MakeMKV found no titles (see makemkv-log.txt)."))
             mkLookup(key, titles)
         } catch (e: Throwable) {
             mkLog("failed: ${android.util.Log.getStackTraceString(e)}")
@@ -508,10 +515,23 @@ class MainActivity : Activity() {
     private fun mkLookup(key: String, titles: List<MakeMkv.Title>) {
         val d = makemkv.identify(titles)
         if (d.kind != "episodes") return
-        val r = EpisodeGuide.lookup(d.name, d.season, d.discNo, d.main.map { it.minutes }) { mkLog(it) } ?: return
+        val r = EpisodeGuide.lookup(d.name, d.season, d.discNo, d.main.map { it.minutes }, episodeShift(d)) { mkLog(it) } ?: return
         mkLog("episodes: ${r.show} (${r.premiered}): " + r.episodes.joinToString(" | ") { "${it.season}x${it.number} ${it.name}" })
         mkGuide[key] = r
         js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
+    }
+
+    /** The user's correction of the episode numbers of this disc (kept per series, season and disc). */
+    private fun shiftKey(d: MakeMkv.Disc) = "shift:${d.name}:${d.season}:${d.discNo}"
+    private fun episodeShift(d: MakeMkv.Disc) = getSharedPreferences("makemkv", MODE_PRIVATE).getInt(shiftKey(d), 0)
+
+    /** Shifts the episode numbers of the disc [key] by [by] and names them again. */
+    private fun mkShift(key: String, by: Int) {
+        val titles = mkTitles[key] ?: return
+        val d = makemkv.identify(titles)
+        getSharedPreferences("makemkv", MODE_PRIVATE).edit().putInt(shiftKey(d), episodeShift(d) + by).apply()
+        mkGuide.remove(key)
+        mkLookup(key, titles)
     }
 
     /** The next language (or automatic / off) for the audio or the subtitles of the disc [key]. */
@@ -533,20 +553,20 @@ class MainActivity : Activity() {
         main.post { closePlayer(); closed.countDown() }
         closed.await()
         mkLog("---- play $uri")
-        if (makemkv.keyMode.isEmpty()) say("MakeMKV has no key yet: choose the forum's beta key or enter your own (in the drive's list).", 10000)
+        if (makemkv.keyMode.isEmpty()) say(t("MakeMKV hat noch keinen Schlüssel: Beta-Schlüssel aus dem Forum wählen oder eigenen eingeben (in der Liste der Disc).", "MakeMKV has no key yet: choose the forum's beta key or enter your own (in the drive's list)."), 10000)
         val device = discs.lend(key)
-        if (device == null) { say("The drive is gone."); discs.giveBack(key); return }
+        if (device == null) { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); discs.giveBack(key); return }
         mkKey = key
         try {
-            say("MakeMKV: opening the drive …")
-            if (!makemkv.openBridge(device)) { say("MakeMKV: the drive could not be opened (see makemkv-log.txt)."); stopMakeMkv(); return }
+            say(t("MakeMKV öffnet das Laufwerk …", "MakeMKV: opening the drive …"))
+            if (!makemkv.openBridge(device)) { say(t("MakeMKV: das Laufwerk lässt sich nicht öffnen (siehe makemkv-log.txt).", "MakeMKV: the drive could not be opened (see makemkv-log.txt).")); stopMakeMkv(); return }
             if (mkReload || !makemkv.identify()) {
                 mkReload = false
                 mkLog("drive stuck before the start: eject and reload")
-                say("The drive does not answer: the disc is ejected and loaded again …", 60000)
+                say(t("Das Laufwerk antwortet nicht: die Disc wird aus- und wieder eingezogen …", "The drive does not answer: the disc is ejected and loaded again …"), 60000)
                 if (!makemkv.ejectAndReload() || !makemkv.identify()) {
                     mkLog("drive still stuck: the user is asked to switch it off and on")
-                    say("The drive still does not answer. Switch the drive off and on again, then start the film again.", 30000)
+                    say(t("Das Laufwerk antwortet weiterhin nicht. Bitte aus- und wieder einschalten und den Film neu starten.", "The drive still does not answer. Switch the drive off and on again, then start the film again."), 30000)
                     stopMakeMkv(); return
                 }
             }
@@ -557,13 +577,13 @@ class MainActivity : Activity() {
                 // the drive answers reads with timeouts: the disc out and in once; then it is the user's turn
                 if (attempt == 1) {
                     mkLog("drive stuck: eject and reload")
-                    say("The drive stopped answering: the disc is ejected and loaded again …", 60000)
+                    say(t("Das Laufwerk antwortet nicht mehr: die Disc wird aus- und wieder eingezogen …", "The drive stopped answering: the disc is ejected and loaded again …"), 60000)
                     mkPipe?.close(); mkPipe = null
                     if (!makemkv.ejectAndReload()) break
                 }
             }
             mkLog("drive still stuck: the user is asked to switch it off and on")
-            say("The drive still does not answer. Switch the drive off and on again, then start the film again.", 30000)
+            say(t("Das Laufwerk antwortet weiterhin nicht. Bitte aus- und wieder einschalten und den Film neu starten.", "The drive still does not answer. Switch the drive off and on again, then start the film again."), 30000)
             stopMakeMkv()
         } catch (e: Throwable) {
             mkLog("failed: ${android.util.Log.getStackTraceString(e)}")
@@ -576,7 +596,7 @@ class MainActivity : Activity() {
     private fun mkAttempt(key: String, which: String, uri: Uri): Boolean {
         var titles = mkTitles[key]
         if (titles == null) {
-            say("MakeMKV: reading the disc (this takes a minute) …", 60000)
+            say(t("MakeMKV liest die Disc (dauert etwa eine Minute) …", "MakeMKV: reading the disc (this takes a minute) …"), 60000)
             titles = makemkv.titles()
             if (makemkv.driveStuck) return false
             mkLog("titles: " + titles.joinToString(" | "))
@@ -585,8 +605,8 @@ class MainActivity : Activity() {
         }
         if (mkKey != key) return true
         val t = (if (which == "main") makemkv.identify(titles).let { d -> d.all ?: d.main.firstOrNull() } else titles.firstOrNull { it.id.toString() == which })
-        if (t == null) { say("MakeMKV found no title on this disc (see makemkv-log.txt).", 10000); stopMakeMkv(); return true }
-        say("MakeMKV: starting ${t.name} (${t.durationMs / 60000} min) …", 60000)
+        if (t == null) { say(t("MakeMKV hat auf dieser Disc keinen Titel gefunden (siehe makemkv-log.txt).", "MakeMKV found no title on this disc (see makemkv-log.txt)."), 10000); stopMakeMkv(); return true }
+        say(t("Wird gestartet (${t.durationMs / 60000} min, etwa eine Minute) …", "Starting (${t.durationMs / 60000} min, about a minute) …"), 60000)
         makemkv.clearCache()
         val plan = makemkv.cachePlan()
         mkLog("cache: $plan (${plan.why})")
@@ -597,7 +617,7 @@ class MainActivity : Activity() {
         val t0 = System.currentTimeMillis()
         if (!pipe.awaitStart()) {
             if (makemkv.driveStuck) return false
-            say("MakeMKV stopped before the film began (see makemkv-log.txt).", 10000); stopMakeMkv(); return true
+            say(t("MakeMKV hat vor dem Film aufgehört (siehe makemkv-log.txt).", "MakeMKV stopped before the film began (see makemkv-log.txt)."), 10000); stopMakeMkv(); return true
         }
         mkLog("first bytes after ${System.currentTimeMillis() - t0} ms")
         // a head start: the player begins when a few seconds of film are in the cache
@@ -721,10 +741,12 @@ class MainActivity : Activity() {
                     "#rip" -> discs.rip(key, say)
                     "#keys" -> discs.loadKeyDatabase(say)
                     "#info" -> say(discs.keyInfo(key, true))
-                    "#mkbeta" -> { makemkv.useBetaKey(); say("MakeMKV: the beta key is fetched from the forum now and every day.") }
+                    "#mkbeta" -> { makemkv.useBetaKey(); say(t("MakeMKV: der Beta-Schlüssel wird jetzt und dann täglich aus dem Forum geholt.", "MakeMKV: the beta key is fetched from the forum now and every day.")) }
                     "#mkown" -> askOwnKey()
                     "#mkread" -> mkRead(key, say)
                     "#mkaudio" -> mkCycle(key, "audio")
+                    "#mkup" -> mkShift(key, 1)
+                    "#mkdown" -> mkShift(key, -1)
                     "#mksub" -> mkCycle(key, "text")
                     "#mkcache" -> {
                         makemkv.cacheMode = when (makemkv.cacheMode) { "auto" -> "ram"; "ram" -> "storage"; else -> "auto" }
