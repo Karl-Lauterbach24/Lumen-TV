@@ -38,7 +38,11 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
 
     companion object { var READ_BUFFER_MB = 16 }
 
-    class Title(val id: Int, val name: String, val durationMs: Long, val size: String, val file: String, val chapters: Int = 0) {
+    /** A stream of a title, from MakeMKV's SINFO: [type] "audio" / "text" / "video", [lang] ISO 639-1 where known. */
+    class Stream(val type: String, val lang: String, val langName: String, val codec: String, val channels: Int)
+
+    class Title(val id: Int, val name: String, val durationMs: Long, val size: String, val file: String, val chapters: Int = 0,
+                val streams: List<Stream> = emptyList()) {
         override fun toString() = "#$id $name ${durationMs / 60000} min $size"
         val minutes get() = (durationMs / 60000).toInt()
     }
@@ -177,6 +181,21 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
             log("MakeMKV: the forum cannot be reached ($e)")
         }
     }
+
+    // ---------------------------------------------------------------- audio and subtitles chosen before playing
+
+    /** "" = automatic (the television's language), else an ISO 639-1 code */
+    var audioLang: String
+        get() = prefs.getString("audioLang", "") ?: ""
+        set(v) { prefs.edit().putString("audioLang", v).apply() }
+    /** "" = automatic, "off", or an ISO 639-1 code */
+    var subLang: String
+        get() = prefs.getString("subLang", "") ?: ""
+        set(v) { prefs.edit().putString("subLang", v).apply() }
+
+    /** The languages of [type] streams in [titles], in the order they first appear. */
+    fun languages(titles: List<Title>, type: String): List<String> =
+        titles.flatMap { t -> t.streams.filter { it.type == type && it.lang.isNotEmpty() }.map { it.lang } }.distinct()
 
     // ---------------------------------------------------------------- the cache between MakeMKV and the player
 
@@ -454,8 +473,12 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         val p = command(listOf("-r", "--cache=16", "info", "disc:0"), emptyMap()).start()
         proc = p
         val info = HashMap<Int, HashMap<Int, String>>()
+        val sinfo = HashMap<Int, java.util.TreeMap<Int, HashMap<Int, String>>>()
         discInfo.clear()
         pipeOutput(p) { l ->
+            Regex("""SINFO:(\d+),(\d+),(\d+),\d+,"(.*)"""").find(l)?.let {
+                sinfo.getOrPut(it.groupValues[1].toInt()) { java.util.TreeMap() }.getOrPut(it.groupValues[2].toInt()) { HashMap() }[it.groupValues[3].toInt()] = it.groupValues[4]
+            }
             Regex("""CINFO:(\d+),\d+,"(.*)"""").find(l)?.let { discInfo[it.groupValues[1].toInt()] = it.groupValues[2] }
             val m = Regex("""TINFO:(\d+),(\d+),\d+,"(.*)"""").find(l) ?: return@pipeOutput
             info.getOrPut(m.groupValues[1].toInt()) { HashMap() }[m.groupValues[2].toInt()] = m.groupValues[3]
@@ -464,7 +487,13 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         return info.toSortedMap().map { (id, a) ->
             val parts = (a[9] ?: "0:0:0").split(':').map { it.toLongOrNull() ?: 0 }
             val ms = ((parts.getOrElse(0) { 0 } * 60 + parts.getOrElse(1) { 0 }) * 60 + parts.getOrElse(2) { 0 }) * 1000
-            Title(id, a[2] ?: "Title $id", ms, a[10] ?: "", a[27] ?: "title_t%02d.mkv".format(id), a[8]?.toIntOrNull() ?: 0)
+            Title(id, a[2] ?: "Title $id", ms, a[10] ?: "", a[27] ?: "title_t%02d.mkv".format(id), a[8]?.toIntOrNull() ?: 0,
+                sinfo[id]?.values?.map { v ->
+                    val type = when (v[1]) { "Audio" -> "audio"; "Subtitles" -> "text"; "Video" -> "video"; else -> v[1].orEmpty().lowercase() }
+                    val code = v[3].orEmpty()
+                    Stream(type, if (code.isEmpty()) "" else androidx.media3.common.util.Util.normalizeLanguageCode(code) ?: code,
+                        v[4].orEmpty(), v[6] ?: v[7].orEmpty(), v[14]?.toIntOrNull() ?: 0)
+                }.orEmpty())
         }
     }
 
@@ -550,6 +579,7 @@ class PipeDataSource(private val pipe: PipeStream) : androidx.media3.datasource.
         transferInitializing(dataSpec)
         pipe.seekTo(dataSpec.position)
         transferStarted(dataSpec)
+        started = true
         return androidx.media3.common.C.LENGTH_UNSET.toLong()
     }
 
@@ -562,7 +592,8 @@ class PipeDataSource(private val pipe: PipeStream) : androidx.media3.datasource.
     }
 
     override fun getUri() = uri
-    override fun close() { if (uri != null) { uri = null; transferEnded() } }
+    override fun close() { uri = null; if (started) { started = false; transferEnded() } }
+    private var started = false
 }
 
 /**

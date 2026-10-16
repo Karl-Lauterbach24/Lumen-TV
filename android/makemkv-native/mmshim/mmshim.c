@@ -34,6 +34,17 @@
 #define SOCKET_NAME "lumen.mmshim.usb"
 #define CHUNK (64 * 1024)
 
+/* back-pressure (see write_all) */
+static volatile int w_busy;
+static volatile long long w_progress_ms;
+static long long now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000LL + t.tv_nsec / 1000000;
+}
+static unsigned long long held_ms;
+
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int usb_fd = -1, ep_in, ep_out, iface;
 static uint32_t tag = 1;
@@ -205,6 +216,13 @@ static int do_sg_io(struct sg_io_hdr *h)
     unsigned timeout = h->timeout ? h->timeout : 60000;
     unsigned done = 0;
 
+    /* a read of the disc waits while the stream's writer is stuck (see write_all) */
+    uint8_t op = h->cmdp[0];
+    if (op == 0x28 || op == 0xa8 || op == 0xbe) {
+        long long w0 = now_ms();
+        while (w_busy && now_ms() - w_progress_ms > 150) usleep(20000);
+        held_ms += now_ms() - w0;
+    }
     struct timespec c0;
     clock_gettime(CLOCK_MONOTONIC, &c0);
     uint8_t key = 0, asc = 0, ascq = 0;
@@ -248,8 +266,8 @@ static int do_sg_io(struct sg_io_hdr *h)
     double since = (now.tv_sec - stat_last.tv_sec) + (now.tv_nsec - stat_last.tv_nsec) / 1e9;
     if (logging >= 1 && since >= 5) {
         double total = (now.tv_sec - stat_start.tv_sec) + (now.tv_nsec - stat_start.tv_nsec) / 1e9;
-        LOG("stats: %llu commands, %.1f MB read, now %.2f MB/s, average %.2f MB/s", stat_cmds, stat_bytes / 1e6,
-            (stat_bytes - stat_last_bytes) / 1e6 / since, stat_bytes / 1e6 / total);
+        LOG("stats: %llu commands, %.1f MB read, now %.2f MB/s, average %.2f MB/s, reading held %.1f s", stat_cmds, stat_bytes / 1e6,
+            (stat_bytes - stat_last_bytes) / 1e6 / since, stat_bytes / 1e6 / total, held_ms / 1000.0);
         stat_last = now; stat_last_bytes = stat_bytes;
     }
     return 0;
@@ -430,15 +448,26 @@ static int is_outfd(int fd) { return fd >= 0 && fd < 1024 && outfd[fd]; }
 static int is_streamfd(int fd) { return fd >= 0 && fd < 1024 && streamfd[fd]; }
 
 /* all of buf into the pipe */
+/*
+ * Back-pressure. MakeMKV reads the disc as fast as the drive goes and keeps in memory what it cannot write
+ * yet, without a limit: on a television with 1 GB it grew by 200 MB in ten seconds once the player's cache
+ * was full. So: while the stream's writer has been waiting for the pipe for a while (nothing taken for
+ * 150 ms), the drive is not read; reading goes on as soon as the player takes data again.
+ */
+
 static int write_all(int fd, const char *buf, size_t n)
 {
     static ssize_t (*real)(int, const void *, size_t);
     if (!real) real = dlsym(RTLD_NEXT, "write");
+    int stream = fd >= 0 && fd < 1024 && streamfd[fd];
+    if (stream) { w_progress_ms = now_ms(); w_busy = 1; }
     while (n) {
         ssize_t w = real(fd, buf, n);
-        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        if (w < 0) { if (errno == EINTR) continue; if (stream) w_busy = 0; return -1; }
         buf += w; n -= w;
+        if (stream) w_progress_ms = now_ms();
     }
+    if (stream) w_busy = 0;
     return 0;
 }
 
