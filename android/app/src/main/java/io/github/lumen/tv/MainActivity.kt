@@ -58,6 +58,8 @@ class MainActivity : Activity() {
     @Volatile private var mkKey: String? = null
     private var mkPipe: PipeStream? = null
     private val mkTitles = HashMap<String, List<MakeMkv.Title>>()
+    /** the episodes' names from TVmaze, per disc */
+    private val mkGuide = HashMap<String, EpisodeGuide.Result>()
     private var playerLong = false
     /** the drive got stuck during a film: the disc is ejected and loaded again before the next one */
     @Volatile private var mkReload = false
@@ -429,13 +431,18 @@ class MainActivity : Activity() {
             action(t("Disc mit MakeMKV erkennen", "Identify the disc with MakeMKV"), t("liest die Titel, dauert etwa eine Minute", "reads the titles, takes about a minute"), "mkread", "disc")
         } else {
             val d = makemkv.identify(titles)
-            out.add(JSONObject().put("name", d.label(de).ifEmpty { t("Unbekannte Disc", "Unknown disc") })
+            val guide = mkGuide[key]
+            out.add(JSONObject().put("name", (if (guide != null) d.label(de).replaceFirst(d.name, guide.show + (guide.premiered.take(4).takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: "")) else d.label(de))
+                    .ifEmpty { t("Unbekannte Disc", "Unknown disc") })
                 .put("detail", if (d.kind == "episodes") t("${d.main.size} Episoden", "${d.main.size} episodes") else "Film · ${d.main.firstOrNull()?.minutes ?: 0} min")
                 .put("icon", if (d.kind == "episodes") "episodes" else "film").put("path", "").put("dir", false).put("off", true))
             fun play(tt: MakeMkv.Title, label: String, icon: String) = out.add(JSONObject().put("name", label)
                 .put("detail", "${tt.minutes} min · ${tt.size}").put("icon", icon).put("path", "disc:$key|#mk${tt.id}")
                 .put("dir", false).put("uri", "makemkv://$key/${tt.id}").put("video", true))
-            if (d.kind == "episodes") d.main.forEachIndexed { i, tt -> play(tt, "Episode ${i + 1}", "film") }
+            if (d.kind == "episodes") d.main.forEachIndexed { i, tt ->
+                val e = guide?.episodes?.getOrNull(i)
+                play(tt, if (e != null) t("Folge ${e.number} · ${e.name}", "Episode ${e.number} · ${e.name}") else "Episode ${i + 1}", "film")
+            }
             else d.main.firstOrNull()?.let { play(it, t("Film abspielen", "Play the film"), "film") }
             // audio and subtitles, chosen before playing (the languages of the film or the episodes)
             val audio = makemkv.languages(d.main, "audio")
@@ -489,11 +496,22 @@ class MainActivity : Activity() {
             mkLog("titles: " + titles.joinToString(" | "))
             if (titles.isNotEmpty()) mkTitles[key] = titles
             else say("MakeMKV found no titles (see makemkv-log.txt).")
+            mkLookup(key, titles)
         } catch (e: Throwable) {
             mkLog("failed: ${android.util.Log.getStackTraceString(e)}")
         } finally {
             stopMakeMkv()
         }
+    }
+
+    /** A series disc: the names of its episodes from TVmaze (only the series' name is sent). */
+    private fun mkLookup(key: String, titles: List<MakeMkv.Title>) {
+        val d = makemkv.identify(titles)
+        if (d.kind != "episodes") return
+        val r = EpisodeGuide.lookup(d.name, d.season, d.discNo, d.main.map { it.minutes }) { mkLog(it) } ?: return
+        mkLog("episodes: ${r.show} (${r.premiered}): " + r.episodes.joinToString(" | ") { "${it.season}x${it.number} ${it.name}" })
+        mkGuide[key] = r
+        js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
     }
 
     /** The next language (or automatic / off) for the audio or the subtitles of the disc [key]. */
