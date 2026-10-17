@@ -428,10 +428,12 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         var prg = 0
         var timeouts = 0
         driveStuck = false
+        keyUnknown = false
         // (stopping makemkvcon interrupts the read: that ends the output, it is no error)
         try {
             p.inputStream.bufferedReader().forEachLine { l ->
                 onLine(l)
+                if (l.startsWith("MSG:3303")) keyUnknown = true       // "The volume key is unknown for this disc"
                 if (l.startsWith("MSG:2003") && l.contains("TIMEOUT ON LOGICAL UNIT") && ++timeouts == 3) {
                     log("drive: 3 read timeouts: makemkvcon is stopped")
                     driveStuck = true
@@ -447,6 +449,11 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
             }
         } catch (_: java.io.IOException) { }
     }
+
+    /** The last run of makemkvcon said it does not know the disc's key (a disc newer than MakeMKV's list). */
+    @Volatile var keyUnknown = false
+    fun noKey(label: String) = prefs.getBoolean("nokey:$label", false)
+    fun setNoKey(label: String, v: Boolean) { prefs.edit().putBoolean("nokey:$label", v).apply() }
 
     private var lastIdentify = ""
 

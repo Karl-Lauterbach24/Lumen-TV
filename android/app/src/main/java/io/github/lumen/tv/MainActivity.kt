@@ -642,7 +642,11 @@ class MainActivity : Activity() {
             }
             if (mkKey == key && mkReading.contains(key))
                 note(t("Disc wird erkannt …", "Identifying the disc …"), t("etwa eine Minute", "about a minute"), "disc")
-            else action(t("Disc mit MakeMKV erkennen", "Identify the disc with MakeMKV"), t("liest die Titel, etwa eine Minute", "reads the titles, about a minute"), "mkread", "disc")
+            else if (makemkv.noKey(mkLabel(key))) {
+                note(t("MakeMKV kennt den Schlüssel dieser Disc nicht", "MakeMKV does not know this disc's key"),
+                    t("meist eine neue 4K-Disc (AACS 2): MakeMKV hat sie zur Auswertung gesendet; eine neuere MakeMKV-Version löst das", "mostly a new 4K disc (AACS 2): MakeMKV has sent it for analysis; a newer MakeMKV version solves it"), "key")
+                action(t("Noch einmal versuchen", "Try again"), t("liest die Titel, etwa eine Minute", "reads the titles, about a minute"), "mkread", "refresh")
+            } else action(t("Disc mit MakeMKV erkennen", "Identify the disc with MakeMKV"), t("liest die Titel, etwa eine Minute", "reads the titles, about a minute"), "mkread", "disc")
             return out
         }
         if (mkMenuNamesOf(key) == null && !makemkv.menuTried(mkLabel(key)) && mkMenuState.isEmpty() && mkKey == null && discs.udf(key) != null && mkMenuTriggered.add(key))
@@ -853,7 +857,11 @@ class MainActivity : Activity() {
             val titles = makemkv.titles()
             mkLog("titles: " + titles.joinToString(" | "))
             if (titles.isNotEmpty()) { mkTitles[key] = titles; makemkv.saveTitles(mkLabel(key), titles) }
-            else say(t("MakeMKV hat keine Titel gefunden (siehe makemkv-log.txt).", "MakeMKV found no titles (see makemkv-log.txt)."))
+            else if (makemkv.keyUnknown) {
+                makemkv.setNoKey(mkLabel(key), true)
+                say(t("MakeMKV kennt den Schlüssel dieser Disc nicht.", "MakeMKV does not know this disc's key."))
+            } else say(t("MakeMKV hat keine Titel gefunden (siehe makemkv-log.txt).", "MakeMKV found no titles (see makemkv-log.txt)."))
+            if (titles.isNotEmpty()) makemkv.setNoKey(mkLabel(key), false)
             mkLookup(key, titles)
             if (titles.isNotEmpty()) mkAfterRead = key
         } catch (e: Throwable) {
