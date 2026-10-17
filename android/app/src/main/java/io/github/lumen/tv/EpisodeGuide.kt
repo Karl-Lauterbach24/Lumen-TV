@@ -16,7 +16,9 @@ import java.net.URLEncoder
  */
 object EpisodeGuide {
     class Episode(val season: Int, val number: Int, val name: String, val minutes: Int)
-    class Result(val show: String, val premiered: String, val episodes: List<Episode>, val firstGuessed: Boolean)
+    /** [start]: index of the first episode in the season; [base]: where the reckoning put it; [slots]: how many places there are. */
+    class Result(val show: String, val premiered: String, val episodes: List<Episode>, val firstGuessed: Boolean,
+                 val start: Int = 0, val base: Int = 0, val slots: Int = 1)
 
     private fun get(url: String): String {
         val c = URL(url).openConnection() as HttpURLConnection
@@ -54,7 +56,8 @@ object EpisodeGuide {
                 log("TVmaze: ${show.optString("name")} (${show.optString("premiered")}) season $season: ${inSeason.size} episodes, lengths off by %.0f min".format(java.util.Locale.ROOT, off))
                 if (best == null || off < best.first) {
                     val from = (start + shift).coerceIn(0, inSeason.size - k)
-                    best = off to Result(show.optString("name"), show.optString("premiered"), inSeason.subList(from, from + k), discNo > 0)
+                    best = off to Result(show.optString("name"), show.optString("premiered"), inSeason.subList(from, from + k), discNo > 0,
+                        from, start, inSeason.size - k + 1)
                 }
             }
             best?.takeIf { it.first <= 12 }?.second

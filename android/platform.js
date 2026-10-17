@@ -91,6 +91,12 @@
       watch: function (cb) { window.__lumenDrivesChanged = cb; }
     },
 
+    // the settings the television itself offers (sections, then the items of a section; act: choose / change one)
+    settings: {
+      list: function (section, done) { ask('settings', section, done); },
+      act: function (item, done) { ask('settingAct', item, function () { done(); }); }
+    },
+
     keys: {}
   };
 })();

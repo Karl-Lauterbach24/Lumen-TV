@@ -80,7 +80,7 @@ class MainActivity : Activity() {
         mkLog("Lumen TV ${packageManager.getPackageInfo(packageName, 0).versionName}, ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}, " +
             "MakeMKV ${if (makemkv.available) "available (${makemkv.abi})" else "not available on this device"}, key: ${makemkv.keyMode.ifEmpty { "none" }}")
         makemkv.refreshBetaKeyIfDue()
-        discs.extraEntries = { key -> mkEntries(key) }
+        discs.extraEntries = { key, rel -> mkEntries(key, rel) }
         makemkv.onStuck = {
             if ((mkPipe?.position ?: 0L) > 0L) {
                 mkReload = true
@@ -205,21 +205,26 @@ class MainActivity : Activity() {
     }
 
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    /** The audio and subtitle languages chosen (in the settings or on the disc page) for what is about to play. */
+    private fun applyLanguages(p: ExoPlayer) {
+        val b = p.trackSelectionParameters.buildUpon()
+        val a = makemkv.audioLang
+        b.setPreferredAudioLanguages(*(listOf(a, java.util.Locale.getDefault().language).filter { it.isNotEmpty() }.toTypedArray()))
+        when (val sl = makemkv.subLang) {
+            "off" -> b.setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, true)
+            "" -> b.setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, false)
+            else -> b.setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, false).setPreferredTextLanguage(sl).setSelectUndeterminedTextLanguage(false)
+        }
+        b.clearOverrides()
+        p.trackSelectionParameters = b.build()
+    }
+
     private fun open(uri: Uri, hls: Boolean, prepared: androidx.media3.extractor.ExtractorsFactory? = null) {
         val p = ensurePlayer(uri.scheme == "makemkv")
+        if (uri.scheme != "makemkv") applyLanguages(p)
         if (uri.scheme == "makemkv") {
             val pipe = mkPipe ?: return
-            // the audio and subtitles chosen on the disc page
-            val b = p.trackSelectionParameters.buildUpon()
-            val a = makemkv.audioLang
-            b.setPreferredAudioLanguages(*(listOf(a, java.util.Locale.getDefault().language).filter { it.isNotEmpty() }.toTypedArray()))
-            when (val sl = makemkv.subLang) {
-                "off" -> b.setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, true)
-                "" -> b.setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, false)
-                else -> b.setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, false).setPreferredTextLanguage(sl).setSelectUndeterminedTextLanguage(false)
-            }
-            b.clearOverrides()
-            p.trackSelectionParameters = b.build()
+            applyLanguages(p)
             val factory = androidx.media3.datasource.DataSource.Factory { PipeDataSource(pipe) }
             // only Matroska, and no look for the index at the end: the stream cannot go there and back
             val extractors = androidx.media3.extractor.ExtractorsFactory {
@@ -400,6 +405,60 @@ class MainActivity : Activity() {
         if (mkKey != null) mkLog("player: $type track $which chosen")
     }
 
+    // ---- the settings of the television (the page asks for them: Settings › Playback, Settings › Disc and MakeMKV) ----
+    private val langChoices = listOf("", "de", "en", "fr", "es", "it", "pt", "nl", "pl", "ja")
+
+    private fun langLabel(code: String, off: String = "", auto: String = ""): String = when (code) {
+        "" -> auto.ifEmpty { t("Automatisch", "Automatic") }
+        "off" -> off.ifEmpty { t("Aus", "Off") }
+        else -> langName(code)
+    }
+
+    private fun settingsJson(section: String): String {
+        val a = org.json.JSONArray()
+        fun item(id: String, label: String, detail: String, icon: String, off: Boolean = false) =
+            a.put(JSONObject().put("id", id).put("label", label).put("detail", detail).put("icon", icon).put("off", off))
+        when (section) {
+            "" -> {
+                item("playback", t("Wiedergabe", "Playback"), "${langLabel(makemkv.audioLang)} · ${langLabel(makemkv.subLang, t("Untertitel aus", "no subtitles"), t("Untertitel automatisch", "subtitles automatic"))}", "volume")
+                if (makemkv.available) item("disc", t("Disc und MakeMKV", "Disc and MakeMKV"),
+                    when (makemkv.keyMode) { "beta" -> t("Beta-Schlüssel", "beta key"); "manual" -> t("eigener Schlüssel", "own key"); else -> t("kein Schlüssel", "no key") }, "disc")
+            }
+            "playback" -> {
+                item("alang", t("Tonsprache", "Audio language"), langLabel(makemkv.audioLang), "volume")
+                item("slang", t("Untertitel", "Subtitles"), langLabel(makemkv.subLang, t("Aus", "Off"), t("Automatisch", "Automatic")), "language")
+                item("note", t("Pro Disc änderbar", "Changeable per disc"), t("auf der Seite der Disc", "on the disc's page"), "info", true)
+            }
+            "disc" -> {
+                val plan = try { makemkv.cachePlan() } catch (_: Exception) { null }
+                item("key-beta", t("Schlüssel: Beta aus dem Forum", "Key: the forum's beta key"),
+                    if (makemkv.keyMode == "beta") t("in Gebrauch, täglich erneuert", "in use, renewed daily") else t("täglich erneuert", "renewed daily"), "key")
+                item("key-own", t("Schlüssel: eigener", "Key: your own"),
+                    if (makemkv.keyMode == "manual") makemkv.ownKey().take(8) + "…" else "", "key")
+                item("cache-mode", t("Zwischenspeicher", "Cache"),
+                    when (makemkv.cacheMode) { "ram" -> t("Arbeitsspeicher", "memory"); "storage" -> t("interner Speicher", "storage"); else -> t("automatisch", "automatic") } +
+                        (plan?.let { " · ${it.bytes shr 20} MB" } ?: ""), "tune")
+                item("cache-size", t("Größe des Zwischenspeichers", "Cache size"), if (makemkv.cacheMb > 0) "${makemkv.cacheMb} MB" else t("automatisch", "automatic"), "tune")
+                item("keydb", t("Schlüsseldatenbank laden", "Load the key database"), t("für Discs ohne MakeMKV", "for discs without MakeMKV"), "download")
+                item("note", "MakeMKV 2.0", (if (makemkv.abi == "arm64-v8a") "64 Bit" else "32 Bit") + " · makemkv-log.txt", "info", true)
+            }
+        }
+        return a.toString()
+    }
+
+    private fun settingAct(item: String) {
+        fun next(list: List<String>, now: String) = list[(list.indexOf(now).coerceAtLeast(0) + 1) % list.size]
+        when (item) {
+            "alang" -> makemkv.audioLang = next(langChoices, makemkv.audioLang)
+            "slang" -> makemkv.subLang = next(listOf("", "off") + langChoices.drop(1), makemkv.subLang)
+            "key-beta" -> { makemkv.useBetaKey(); say(t("MakeMKV: der Beta-Schlüssel wird jetzt und dann täglich aus dem Forum geholt.", "MakeMKV: the beta key is fetched from the forum now and every day.")) }
+            "key-own" -> askOwnKey()
+            "cache-mode" -> makemkv.cacheMode = next(listOf("auto", "ram", "storage"), makemkv.cacheMode)
+            "cache-size" -> makemkv.cacheMb = next(listOf("0", "64", "128", "256", "512", "1024"), makemkv.cacheMb.toString()).toInt()
+            "keydb" -> discs.loadKeyDatabase { say(it) }
+        }
+    }
+
     // ---- MakeMKV (test build) ----
     private val mkLogFile by lazy { java.io.File(getExternalFilesDir(null) ?: filesDir, "makemkv-log.txt") }
 
@@ -420,57 +479,72 @@ class MainActivity : Activity() {
     private fun langName(code: String): String =
         java.util.Locale.forLanguageTag(code).getDisplayLanguage(java.util.Locale.getDefault()).replaceFirstChar { it.titlecase(java.util.Locale.getDefault()) }.ifEmpty { code }
 
-    private fun mkEntries(key: String): List<JSONObject> {
+    /** a drive's disc label (the disc is not open while MakeMKV has the drive: remembered from before) */
+    private val mkLabels = HashMap<String, String>()
+    private fun mkLabel(key: String): String = discs.label(key).ifEmpty { mkLabels[key].orEmpty() }.also { if (it.isNotEmpty()) mkLabels[key] = it }
+    private val mkReading = HashSet<String>()      // discs MakeMKV is reading (or has been asked to, once)
+
+    /** What the disc page of the drive [key] shows besides the disc's own files; [rel] "" is the page, "#extras/" the extras. */
+    private fun mkEntries(key: String, rel: String): List<JSONObject> {
         if (!key.startsWith("usb") || !makemkv.available) return emptyList()
         val out = ArrayList<JSONObject>()
         val de = java.util.Locale.getDefault().language == "de"
         fun t(deText: String, enText: String) = if (de) deText else enText
         fun action(name: String, detail: String, what: String, icon: String) = out.add(JSONObject().put("name", name).put("detail", detail)
             .put("path", "disc:$key|#$what").put("dir", false).put("action", what).put("icon", icon))
+        fun note(name: String, detail: String, icon: String) = out.add(JSONObject().put("name", name).put("detail", detail)
+            .put("icon", icon).put("path", "").put("dir", false).put("off", true))
+        if (mkTitles[key] == null) makemkv.loadTitles(mkLabel(key))?.let { mkTitles[key] = it; kotlin.concurrent.thread { mkLookup(key, it) } }
         val titles = mkTitles[key]
         if (titles == null) {
-            action(t("Disc mit MakeMKV erkennen", "Identify the disc with MakeMKV"), t("liest die Titel, dauert etwa eine Minute", "reads the titles, takes about a minute"), "mkread", "disc")
-        } else {
-            val d = makemkv.identify(titles)
-            val guide = mkGuide[key]
-            out.add(JSONObject().put("name", (if (guide != null) d.label(de).replaceFirst(d.name, guide.show + (guide.premiered.take(4).takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: "")) else d.label(de))
-                    .ifEmpty { t("Unbekannte Disc", "Unknown disc") })
-                .put("detail", if (d.kind == "episodes") t("${d.main.size} Episoden", "${d.main.size} episodes") else "Film · ${d.main.firstOrNull()?.minutes ?: 0} min")
-                .put("icon", if (d.kind == "episodes") "episodes" else "film").put("path", "").put("dir", false).put("off", true))
-            fun play(tt: MakeMkv.Title, label: String, icon: String) = out.add(JSONObject().put("name", label)
-                .put("detail", "${tt.minutes} min · ${tt.size}").put("icon", icon).put("path", "disc:$key|#mk${tt.id}")
-                .put("dir", false).put("uri", "makemkv://$key/${tt.id}").put("video", true))
-            if (d.kind == "episodes") d.main.forEachIndexed { i, tt ->
-                val e = guide?.episodes?.getOrNull(i)
-                play(tt, if (e != null) t("Folge ${e.number} · ${e.name}", "Episode ${e.number} · ${e.name}") else "Episode ${i + 1}", "film")
+            if (rel.isNotEmpty()) return emptyList()
+            // a protected disc the app cannot open itself: MakeMKV is asked at once (once per disc)
+            if (discs.needsMakeMkv(key) && mkKey == null && synchronized(mkReading) { mkReading.add(key) }) {
+                kotlin.concurrent.thread { mkRead(key) { msg -> say(msg) } }
             }
-            else d.main.firstOrNull()?.let { play(it, t("Film abspielen", "Play the film"), "film") }
-            // audio and subtitles, chosen before playing (the languages of the film or the episodes)
-            val audio = makemkv.languages(d.main, "audio")
-            val subs = makemkv.languages(d.main, "text")
-            val a = makemkv.audioLang
-            action(t("Ton: ", "Audio: ") + (if (a.isEmpty() || a !in audio) t("automatisch", "automatic") else langName(a)),
-                audio.joinToString(" · ") { langName(it) }, "mkaudio", "volume")
-            val sl = makemkv.subLang
-            action(t("Untertitel: ", "Subtitles: ") + when { sl == "off" -> t("aus", "off"); sl.isEmpty() || sl !in subs -> t("automatisch", "automatic"); else -> langName(sl) },
-                subs.joinToString(" · ") { langName(it) }.ifEmpty { t("keine auf der Disc", "none on the disc") }, "mksub", "language")
-            if (d.kind == "episodes") d.all?.let { play(it, t("Alle Episoden hintereinander", "All episodes in a row"), "episodes") }
-            // the episode numbers are reckoned from the disc number: they can be shifted where the box is laid out otherwise
-            if (guide != null) {
-                val first = guide.episodes.first().number; val last = guide.episodes.last().number
-                action(t("Folgen $first–$last stimmen nicht? Eine weiter", "Episodes $first–$last wrong? One on"), t("die Folgennummern dieser Disc um eins erhöhen", "raise this disc's episode numbers by one"), "mkup", "episodes")
-                if (first > 1) action(t("Eine Folge zurück", "One episode back"), t("die Folgennummern dieser Disc um eins verringern", "lower this disc's episode numbers by one"), "mkdown", "episodes")
-            }
-            d.extras.take(12).forEachIndexed { i, tt -> play(tt, "Extra ${i + 1}", "extra") }
+            if (mkKey == key && mkReading.contains(key))
+                note(t("Disc wird erkannt …", "Identifying the disc …"), t("etwa eine Minute", "about a minute"), "disc")
+            else action(t("Disc mit MakeMKV erkennen", "Identify the disc with MakeMKV"), t("liest die Titel, etwa eine Minute", "reads the titles, about a minute"), "mkread", "disc")
+            return out
         }
-        val plan = try { makemkv.cachePlan() } catch (_: Exception) { null }
-        val where = when (makemkv.cacheMode) { "ram" -> t("Arbeitsspeicher", "memory"); "storage" -> t("interner Speicher", "storage"); else -> t("automatisch", "automatic") }
-        action("Cache: $where", plan?.let { (if (it.file == null) t("jetzt Arbeitsspeicher", "now memory") else t("jetzt interner Speicher", "now storage")) + ", ${it.bytes shr 20} MB" }.orEmpty(), "mkcache", "tune")
-        action(t("Cache-Größe: ", "Cache size: ") + (if (makemkv.cacheMb > 0) "${makemkv.cacheMb} MB" else t("automatisch", "automatic")), "", "mksize", "tune")
-        val mode = makemkv.keyMode
-        action(t("MakeMKV-Schlüssel: Beta-Schlüssel aus dem Forum", "MakeMKV key: the forum's beta key"),
-            if (mode == "beta") t("in Gebrauch, wird täglich erneuert", "in use, renewed daily") else t("wird täglich erneuert", "renewed daily"), "mkbeta", "key")
-        action(t("MakeMKV-Schlüssel: eigenen eingeben", "MakeMKV key: enter your own"), if (mode == "manual") t("in Gebrauch", "in use") else "", "mkown", "key")
+        val d = makemkv.identify(titles)
+        val guide = mkGuide[key]
+        var group = ""
+        fun play(tt: MakeMkv.Title, label: String, icon: String) = out.add(JSONObject().put("name", label)
+            .put("detail", "${tt.minutes} min · ${tt.size}").put("icon", icon).put("path", "disc:$key|#mk${tt.id}")
+            .put("dir", false).put("uri", "makemkv://$key/${tt.id}").put("video", true).put("group", group))
+        if (rel == "#extras/") {
+            d.extras.forEachIndexed { i, tt -> play(tt, "Extra ${i + 1}", "extra") }
+            return out
+        }
+        if (rel.isNotEmpty()) return emptyList()
+        out.add(JSONObject().put("name", (if (guide != null) d.label(de).replaceFirst(d.name, guide.show + (guide.premiered.take(4).takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: "")) else d.label(de))
+                .ifEmpty { t("Unbekannte Disc", "Unknown disc") })
+            .put("detail", if (d.kind == "episodes") t("${d.main.size} Episoden", "${d.main.size} episodes") else "Film · ${d.main.firstOrNull()?.minutes ?: 0} min")
+            .put("icon", if (d.kind == "episodes") "episodes" else "film").put("path", "").put("dir", false).put("off", true))
+        // the episodes follow one another (the page goes on to the next when one ends); the rest stands alone
+        group = "episodes"
+        if (d.kind == "episodes") d.main.forEachIndexed { i, tt ->
+            val e = guide?.episodes?.getOrNull(i)
+            play(tt, if (e != null) t("Folge ${e.number} · ${e.name}", "Episode ${e.number} · ${e.name}") else "Episode ${i + 1}", "film")
+        }
+        else d.main.firstOrNull()?.let { play(it, t("Film abspielen", "Play the film"), "film") }
+        group = "all"
+        if (d.kind == "episodes") d.all?.let { play(it, t("Alle Episoden hintereinander", "All episodes in a row"), "episodes") }
+        // audio and subtitles, chosen before playing (the languages of the film or the episodes)
+        val audio = makemkv.languages(d.main, "audio")
+        val subs = makemkv.languages(d.main, "text")
+        val a = makemkv.audioLang
+        action(t("Ton", "Audio"), (if (a.isEmpty() || a !in audio) t("automatisch", "automatic") else langName(a)), "mkaudio", "volume")
+        val sl = makemkv.subLang
+        action(t("Untertitel", "Subtitles"), when { sl == "off" -> t("aus", "off"); sl.isEmpty() || sl !in subs -> t("automatisch", "automatic"); else -> langName(sl) }, "mksub", "language")
+        // the episode numbers are reckoned from the disc number: one row steps through the places they can have
+        if (guide != null && guide.slots > 1)
+            action(t("Folgen ${guide.episodes.first().number}–${guide.episodes.last().number}: falsch?", "Episodes ${guide.episodes.first().number}–${guide.episodes.last().number}: wrong?"),
+                t("weiter zur nächsten Zählung", "try the next numbering"), "mkshift", "refresh")
+        if (d.extras.isNotEmpty())
+            out.add(JSONObject().put("name", t("Extras", "Extras")).put("detail", "${d.extras.size}").put("icon", "extra")
+                .put("path", "disc:$key|#extras/").put("dir", true))
         return out
     }
 
@@ -491,6 +565,7 @@ class MainActivity : Activity() {
     /** Reads the disc's titles with MakeMKV (no playing): the page then lists the film or the episodes. */
     private fun mkRead(key: String, say: (String) -> Unit) {
         if (mkKey != null) { say(t("MakeMKV ist beschäftigt.", "MakeMKV is busy.")); return }
+        mkLabel(key)
         mkLog("---- read titles of $key")
         val device = discs.lend(key) ?: run { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); discs.giveBack(key); return }
         mkKey = key
@@ -501,13 +576,14 @@ class MainActivity : Activity() {
             say(if (java.util.Locale.getDefault().language == "de") "MakeMKV liest die Disc …" else "MakeMKV reads the disc …")
             val titles = makemkv.titles()
             mkLog("titles: " + titles.joinToString(" | "))
-            if (titles.isNotEmpty()) mkTitles[key] = titles
+            if (titles.isNotEmpty()) { mkTitles[key] = titles; makemkv.saveTitles(mkLabel(key), titles) }
             else say(t("MakeMKV hat keine Titel gefunden (siehe makemkv-log.txt).", "MakeMKV found no titles (see makemkv-log.txt)."))
             mkLookup(key, titles)
         } catch (e: Throwable) {
             mkLog("failed: ${android.util.Log.getStackTraceString(e)}")
         } finally {
             stopMakeMkv()
+            js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
         }
     }
 
@@ -521,15 +597,17 @@ class MainActivity : Activity() {
         js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
     }
 
-    /** The user's correction of the episode numbers of this disc (kept per series, season and disc). */
+    /** The user's choice of where the episodes of this disc start in the season (kept per series, season and disc). */
     private fun shiftKey(d: MakeMkv.Disc) = "shift:${d.name}:${d.season}:${d.discNo}"
     private fun episodeShift(d: MakeMkv.Disc) = getSharedPreferences("makemkv", MODE_PRIVATE).getInt(shiftKey(d), 0)
 
-    /** Shifts the episode numbers of the disc [key] by [by] and names them again. */
-    private fun mkShift(key: String, by: Int) {
+    /** The next place for the episodes of the disc [key] (after the last, the reckoned one again), named again. */
+    private fun mkShift(key: String) {
         val titles = mkTitles[key] ?: return
+        val g = mkGuide[key] ?: return
         val d = makemkv.identify(titles)
-        getSharedPreferences("makemkv", MODE_PRIVATE).edit().putInt(shiftKey(d), episodeShift(d) + by).apply()
+        val next = (g.start + 1) % g.slots
+        getSharedPreferences("makemkv", MODE_PRIVATE).edit().putInt(shiftKey(d), next - g.base).apply()
         mkGuide.remove(key)
         mkLookup(key, titles)
     }
@@ -552,6 +630,7 @@ class MainActivity : Activity() {
         val closed = java.util.concurrent.CountDownLatch(1)
         main.post { closePlayer(); closed.countDown() }
         closed.await()
+        mkLabel(key)
         mkLog("---- play $uri")
         if (makemkv.keyMode.isEmpty()) say(t("MakeMKV hat noch keinen Schlüssel: Beta-Schlüssel aus dem Forum wählen oder eigenen eingeben (in der Liste der Disc).", "MakeMKV has no key yet: choose the forum's beta key or enter your own (in the drive's list)."), 10000)
         val device = discs.lend(key)
@@ -600,7 +679,7 @@ class MainActivity : Activity() {
             titles = makemkv.titles()
             if (makemkv.driveStuck) return false
             mkLog("titles: " + titles.joinToString(" | "))
-            if (titles.isNotEmpty()) mkTitles[key] = titles
+            if (titles.isNotEmpty()) { mkTitles[key] = titles; makemkv.saveTitles(mkLabel(key), titles) }
             js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
         }
         if (mkKey != key) return true
@@ -741,22 +820,10 @@ class MainActivity : Activity() {
                     "#rip" -> discs.rip(key, say)
                     "#keys" -> discs.loadKeyDatabase(say)
                     "#info" -> say(discs.keyInfo(key, true))
-                    "#mkbeta" -> { makemkv.useBetaKey(); say(t("MakeMKV: der Beta-Schlüssel wird jetzt und dann täglich aus dem Forum geholt.", "MakeMKV: the beta key is fetched from the forum now and every day.")) }
-                    "#mkown" -> askOwnKey()
                     "#mkread" -> mkRead(key, say)
                     "#mkaudio" -> mkCycle(key, "audio")
-                    "#mkup" -> mkShift(key, 1)
-                    "#mkdown" -> mkShift(key, -1)
                     "#mksub" -> mkCycle(key, "text")
-                    "#mkcache" -> {
-                        makemkv.cacheMode = when (makemkv.cacheMode) { "auto" -> "ram"; "ram" -> "storage"; else -> "auto" }
-                        say("MakeMKV cache: ${makemkv.cachePlan()}")
-                    }
-                    "#mksize" -> {
-                        val sizes = listOf(0, 64, 128, 256, 512, 1024)
-                        makemkv.cacheMb = sizes[(sizes.indexOf(makemkv.cacheMb) + 1) % sizes.size]
-                        say("MakeMKV cache: ${makemkv.cachePlan()}")
-                    }
+                    "#mkshift" -> mkShift(key)
                     else -> discs.copy(key, say)
                 }
                 reply(id, "[]")
@@ -766,6 +833,10 @@ class MainActivity : Activity() {
         @JavascriptInterface fun tracks(id: Int) { main.post { reply(id, tracksJson()) } }
         /** Chooses a track ([which] as from [tracks], or "off" for no subtitles). */
         @JavascriptInterface fun track(type: String, which: String) { main.post { selectTrack(type, which) } }
+
+        /** The settings the television itself offers: [section] "" lists the sections, else the items of one. */
+        @JavascriptInterface fun settings(id: Int, section: String) { kotlin.concurrent.thread { reply(id, settingsJson(section)) } }
+        @JavascriptInterface fun settingAct(id: Int, item: String) { kotlin.concurrent.thread { settingAct(item); reply(id, "[]") } }
 
         @JavascriptInterface fun drives(id: Int) { drives.list { json -> reply(id, json) } }
         @JavascriptInterface fun folder(id: Int, path: String) { drives.folder(path) { json -> reply(id, json) } }

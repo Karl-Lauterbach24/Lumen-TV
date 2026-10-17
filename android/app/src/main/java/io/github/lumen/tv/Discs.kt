@@ -78,7 +78,12 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     // ---- a drive lent to MakeMKV (test): the app lets go of it and does not touch it until it is given back ----
     private val lent = HashSet<String>()
     /** Entries put before a drive's own (MakeMKV's), for the drive's first page. */
-    var extraEntries: ((key: String) -> List<JSONObject>)? = null
+    var extraEntries: ((key: String, rel: String) -> List<JSONObject>)? = null
+
+    /** A protected Blu-ray this app cannot decrypt itself (its key is not in the key database). */
+    fun label(key: String): String = synchronized(open) { open[key] }?.label.orEmpty()
+
+    fun needsMakeMkv(key: String): Boolean = synchronized(open) { open[key] }?.let { it.kind == "Blu-ray" && it.encrypted && it.keys == null } ?: false
 
     fun lend(key: String): UsbDevice? {
         synchronized(lent) { lent.add(key) }
@@ -377,12 +382,18 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     }
 
     fun folder(key: String, rel: String): JSONArray {
-        val extra = if (rel.isEmpty()) extraEntries?.invoke(key).orEmpty() else emptyList()
-        if (extra.isEmpty()) return ownFolder(key, rel)
+        val extra = extraEntries?.invoke(key, rel).orEmpty()
+        if (rel.startsWith("#") && rel != "#more/") return JSONArray().also { a -> extra.forEach { a.put(it) } }
+        val own = ownFolder(key, if (rel == "#more/") "" else rel)
+        if (extra.isEmpty() || rel == "#more/") return own
         val out = JSONArray()
         extra.forEach { out.put(it) }
-        val own = ownFolder(key, rel)
-        for (i in 0 until own.length()) out.put(own.get(i))
+        // the disc's own entries while MakeMKV handles the disc: only the ones that do not say "cannot" (the rest under "more")
+        val d = synchronized(open) { open[key] }
+        if (d != null && d.encrypted && d.keys == null)
+            out.put(JSONObject().put("name", t("Weitere Optionen", "More options")).put("detail", t("Schlüsseldatenbank, Diagnose", "key database, diagnostics"))
+                .put("path", "disc:$key|#more/").put("dir", true).put("icon", "tune"))
+        else for (i in 0 until own.length()) out.put(own.get(i))
         return out
     }
 

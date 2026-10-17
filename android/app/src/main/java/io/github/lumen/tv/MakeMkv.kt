@@ -42,7 +42,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     class Stream(val type: String, val lang: String, val langName: String, val codec: String, val channels: Int)
 
     class Title(val id: Int, val name: String, val durationMs: Long, val size: String, val file: String, val chapters: Int = 0,
-                val streams: List<Stream> = emptyList()) {
+                val streams: List<Stream> = emptyList(), val source: String = "", val segments: List<Int> = emptyList()) {
         override fun toString() = "#$id $name ${durationMs / 60000} min $size"
         val minutes get() = (durationMs / 60000).toInt()
     }
@@ -430,6 +430,33 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         } catch (_: java.io.IOException) { }
     }
 
+    private var lastIdentify = ""
+
+    // the titles of a disc are kept (by its label) so that the disc is known at once the next time
+    fun saveTitles(label: String, titles: List<Title>) {
+        if (label.isEmpty() || titles.isEmpty()) return
+        val o = org.json.JSONObject().put("info", org.json.JSONObject(discInfo.mapKeys { it.key.toString() }))
+        o.put("titles", org.json.JSONArray(titles.map { t ->
+            org.json.JSONObject().put("id", t.id).put("name", t.name).put("ms", t.durationMs).put("size", t.size).put("file", t.file)
+                .put("ch", t.chapters).put("src", t.source).put("segs", org.json.JSONArray(t.segments))
+                .put("streams", org.json.JSONArray(t.streams.map { x -> org.json.JSONObject().put("t", x.type).put("l", x.lang).put("n", x.langName).put("c", x.codec).put("ch", x.channels) }))
+        }))
+        prefs.edit().putString("disc:$label", o.toString()).apply()
+    }
+
+    fun loadTitles(label: String): List<Title>? = try {
+        val o = org.json.JSONObject(prefs.getString("disc:$label", null) ?: return null)
+        discInfo.clear()
+        o.getJSONObject("info").let { i -> i.keys().forEach { k -> discInfo[k.toInt()] = i.getString(k) } }
+        val a = o.getJSONArray("titles")
+        (0 until a.length()).map { i ->
+            val t = a.getJSONObject(i)
+            Title(t.getInt("id"), t.getString("name"), t.getLong("ms"), t.getString("size"), t.getString("file"), t.getInt("ch"),
+                t.getJSONArray("streams").let { sa -> (0 until sa.length()).map { j -> sa.getJSONObject(j).let { x -> Stream(x.getString("t"), x.getString("l"), x.getString("n"), x.getString("c"), x.getInt("ch")) } } },
+                t.getString("src"), t.getJSONArray("segs").let { ga -> (0 until ga.length()).map { ga.getInt(it) } })
+        }
+    } catch (_: Exception) { null }
+
     /** MakeMKV's CINFO of the last disc read: 2 = name, 32 = volume name. */
     val discInfo = HashMap<Int, String>()
 
@@ -462,7 +489,14 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         if (group.isNotEmpty()) {
             val sum = group.sumOf { it.durationMs }
             val all = real.firstOrNull { it !in group && it.durationMs >= sum * 92 / 100 && it.durationMs <= sum * 108 / 100 }
+            // the order of the episodes: the "play all" title runs through them in order (its clips), else the
+            // order of the playlists' file names; MakeMKV's title numbers say nothing about it
+            val pos = { t: Title -> val f = t.segments.firstOrNull(); if (all != null && f != null) all.segments.indexOf(f).takeIf { it >= 0 } else null }
+            if (group.all { pos(it) != null }) group = group.sortedBy { pos(it) }
+            else if (group.all { it.source.isNotEmpty() }) group = group.sortedWith(compareBy({ it.source }, { it.id }))
             val extras = real.filter { it !in group && it != all && it.minutes >= 2 }.sortedByDescending { it.durationMs }
+            val msg = "identify: episodes " + group.joinToString(" | ") { "#${it.id} ${it.source} segs ${it.segments}" } + (all?.let { " ; all #${it.id} segs ${it.segments}" } ?: " ; no play-all")
+            if (msg != lastIdentify) { lastIdentify = msg; log(msg) }
             return Disc(name, "episodes", season, discNo, group, all, extras)
         }
         val film = real.maxByOrNull { it.durationMs }
@@ -496,7 +530,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
                     val code = v[3].orEmpty()
                     Stream(type, if (code.isEmpty()) "" else androidx.media3.common.util.Util.normalizeLanguageCode(code) ?: code,
                         v[4].orEmpty(), v[6] ?: v[7].orEmpty(), v[14]?.toIntOrNull() ?: 0)
-                }.orEmpty())
+                }.orEmpty(), a[16].orEmpty(), a[26].orEmpty().split(',').mapNotNull { it.trim().toIntOrNull() })
         }
     }
 
