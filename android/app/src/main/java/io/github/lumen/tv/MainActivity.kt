@@ -84,7 +84,7 @@ class MainActivity : Activity() {
         discs.nameFor = { key -> mkDiscName(key) }
         discs.coverFor = { key, label ->
             val l = mkLabels[key] ?: label
-            val c = makemkv.cover(l)
+            val c = ownCover(key, l).ifEmpty { makemkv.cover(l) }
             // a disc seen before: its titles from the memory (name, picture), once per start
             if (key.startsWith("usb") && makemkv.available && mkTitles[key] == null && makemkv.hasTitles(l) && mkCoverTried.add(key)) kotlin.concurrent.thread {
                 makemkv.loadTitles(l)?.let { mkLabels[key] = l; mkTitles[key] = it; mkLookup(key, it) }
@@ -109,6 +109,8 @@ class MainActivity : Activity() {
             textZoom = 100                                              // the page is laid out in its own units
         }
         val loader = WebViewAssetLoader.Builder()
+            // the pictures the discs bring (BDMV/META/DL/Jacket*.jpg), copied to the app's folder
+            .addPathHandler("/cover/", WebViewAssetLoader.InternalStoragePathHandler(this, java.io.File(filesDir, "covers").apply { mkdirs() }))
             .addPathHandler("/", WebViewAssetLoader.AssetsPathHandler(this))
             .build()
         web.webViewClient = object : WebViewClient() {
@@ -543,6 +545,32 @@ class MainActivity : Activity() {
     private val mkLabels = HashMap<String, String>()
     private fun mkLabel(key: String): String = discs.label(key).ifEmpty { mkLabels[key].orEmpty() }.also { if (it.isNotEmpty()) mkLabels[key] = it }
     private val mkCoverTried = HashSet<String>()
+    private val mkJacketTried = HashSet<String>()
+
+    /**
+     * The picture the disc itself carries (a Blu-ray's BDMV/META/DL/Jacket_*.jpg, the larger one): copied once to the app's folder,
+     * served to the page as /cover/<file>. "" where the disc has none (or is not open now: asked again later).
+     */
+    private fun ownCover(key: String, label: String): String {
+        val name = "c" + label.hashCode().toUInt().toString(16) + ".jpg"
+        val file = java.io.File(java.io.File(filesDir, "covers"), name)
+        if (file.isFile) return "https://appassets.androidplatform.net/cover/$name"
+        val udf = discs.udf(key) ?: return ""
+        if (!key.startsWith("usb") || !mkJacketTried.add(key)) return ""
+        kotlin.concurrent.thread {
+            try {
+                val best = udf.list("BDMV/META/DL").filter { !it.dir && (it.name.endsWith(".jpg", true) || it.name.endsWith(".jpeg", true) || it.name.endsWith(".png", true)) && it.size < 4_000_000 }.maxByOrNull { it.size }
+                if (best != null) {
+                    val r = udf.open("BDMV/META/DL/${best.name}")
+                    file.parentFile?.mkdirs()
+                    java.io.FileOutputStream(file).use { o -> val b = ByteArray(1 shl 16); var pos = 0L; while (true) { val n = r.read(pos, b, 0, b.size); if (n <= 0) break; o.write(b, 0, n); pos += n } }
+                    mkLog("cover: the disc's own picture ${best.name} (${best.size / 1024} KB)")
+                    js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
+                }
+            } catch (e: Exception) { mkLog("cover: no picture on the disc ($e)") }
+        }
+        return ""
+    }
 
     /** "Doctor Who (2005) · Staffel 1 · Disc 3": the name of an identified disc (the series from TVmaze where known). */
     private fun mkDiscName(key: String): String {
@@ -565,7 +593,8 @@ class MainActivity : Activity() {
             .put("path", "disc:$key|#$what").put("dir", false).put("action", what).put("icon", icon))
         fun note(name: String, detail: String, icon: String) = out.add(JSONObject().put("name", name).put("detail", detail)
             .put("icon", icon).put("path", "").put("dir", false).put("off", true))
-        if (rel == "#more/") return listOf(JSONObject().put("name", t("Disc neu einlesen", "Read the disc again")).put("detail", t("Titel, Spuren, Folgen", "titles, tracks, episodes"))
+        if (rel == "#more/") return listOf(JSONObject().put("name", t("Menü-Dateien der Disc sichern", "Save the disc's menu files")).put("detail", t("Diagnose: Java-Menü, Metadaten", "diagnostics: Java menu, metadata"))
+            .put("icon", "download").put("path", "disc:$key|#mkdump").put("dir", false).put("action", "mkdump"), JSONObject().put("name", t("Disc neu einlesen", "Read the disc again")).put("detail", t("Titel, Spuren, Folgen", "titles, tracks, episodes"))
             .put("icon", "refresh").put("path", "disc:$key|#mkreset").put("dir", false).put("action", "mkreset"))
         if (mkTitles[key] == null) makemkv.loadTitles(mkLabel(key))?.let { mkTitles[key] = it; kotlin.concurrent.thread { mkLookup(key, it) } }
         val titles = mkTitles[key]
@@ -640,6 +669,41 @@ class MainActivity : Activity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    /**
+     * Copies what the disc's menu is made of (it is not encrypted: only the films are) to the app's folder, to see what a menu says about
+     * its tracks without running it: the Java programs (BDMV/JAR), their descriptions (BDMV/BDJO), the metadata (BDMV/META), the menu
+     * commands. Returns a message.
+     */
+    private fun dumpMenuFiles(key: String): String {
+        val udf = discs.udf(key) ?: return t("Die Disc ist gerade nicht frei.", "The disc is not free right now.")
+        val out = java.io.File(getExternalFilesDir(null) ?: filesDir, "disc-dump").apply { deleteRecursively(); mkdirs() }
+        var files = 0; var bytes = 0L
+        fun copy(path: String) {
+            try {
+                for (e in udf.list(path)) {
+                    val p = "$path/${e.name}"
+                    if (e.dir) { copy(p); continue }
+                    if (e.size > 30_000_000) continue
+                    val target = java.io.File(out, p.removePrefix("BDMV/")); target.parentFile?.mkdirs()
+                    val r = udf.open(p)
+                    java.io.FileOutputStream(target).use { o ->
+                        val b = ByteArray(1 shl 16); var pos = 0L
+                        while (true) { val n = r.read(pos, b, 0, b.size); if (n <= 0) break; o.write(b, 0, n); pos += n }
+                    }
+                    files++; bytes += e.size
+                }
+            } catch (ex: Exception) { mkLog("dump $path: $ex") }
+        }
+        for (d in listOf("BDMV/JAR", "BDMV/BDJO", "BDMV/META", "BDMV/AUXDATA", "BDMV/CLIPINF", "CERTIFICATE")) copy(d)
+        for (f in listOf("BDMV/index.bdmv", "BDMV/MovieObject.bdmv")) try {
+            val r = udf.open(f); val b = ByteArray(r.size.toInt()); var n = 0
+            while (n < b.size) { val k = r.read(n.toLong(), b, n, b.size - n); if (k <= 0) break; n += k }
+            java.io.File(out, f.removePrefix("BDMV/")).writeBytes(b); files++; bytes += b.size
+        } catch (_: Exception) { }
+        mkLog("dump: $files files, ${bytes / 1024} KB in ${out.path}")
+        return t("$files Dateien gesichert (${bytes / 1024} KB): Android/data/io.github.lumen.tv/files/disc-dump", "$files files saved (${bytes / 1024} KB): Android/data/io.github.lumen.tv/files/disc-dump")
     }
 
     /** The playlists' stream tables, read from the disc itself before MakeMKV has the drive (key -> playlist name -> table). */
@@ -1012,6 +1076,7 @@ class MainActivity : Activity() {
                     "#info" -> say(discs.keyInfo(key, true))
                     "#mkread" -> mkRead(key, say)
                     "#mkshift" -> mkShift(key)
+                    "#mkdump" -> say(dumpMenuFiles(key))
                     "#mkreset" -> {
                         makemkv.forgetTitles(mkLabel(key)); mkTitles.remove(key); mkGuide.remove(key); mkStn.remove(key)
                         synchronized(mkReading) { mkReading.remove(key) }
