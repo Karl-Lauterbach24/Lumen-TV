@@ -20,6 +20,8 @@ class RemoteBd(private val makemkv: MakeMkv, private val log: (String) -> Unit) 
     var overlay: ((plane: Int, x: Int, y: Int, w: Int, h: Int, pixels: IntArray?) -> Unit)? = null
     /** A sound effect of the disc's menu: 16 bit samples, interleaved. */
     var onSound: ((samples: ShortArray, channels: Int) -> Unit)? = null
+    /** MakeMKV's library said it does not know the disc's key (a disc it cannot decrypt). */
+    @Volatile var keyUnknown = false
     @Volatile var opened = false
         private set
 
@@ -37,6 +39,7 @@ class RemoteBd(private val makemkv: MakeMkv, private val log: (String) -> Unit) 
             val last = ArrayDeque<String>()
             try {
                 p.inputStream.bufferedReader().forEachLine { l ->
+                    if (l.contains("volume key is unknown")) keyUnknown = true
                     if (!l.startsWith("FLUSH ") && !l.startsWith("CLEAR ")) { last.addLast(l.take(160)); if (last.size > 14) last.removeFirst(); if (l != "READY") log("bdmenu: ${l.take(200)}") }
                     when {
                         l == "READY" -> { opened = true; ready.countDown() }

@@ -660,9 +660,14 @@ class MainActivity : Activity() {
         val base = d.label(de)
         return if (guide != null && d.name.isNotEmpty()) base.replaceFirst(d.name, guide.show + (guide.premiered.take(4).takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: "")) else base
     }
+    @Volatile private var mkMenuWanted = false
     private val mkReading = HashSet<String>()      // discs MakeMKV is reading (or has been asked to, once)
 
     /** What the disc page of the drive [key] shows besides the disc's own files; [rel] "" is the page, "#extras/" the extras. */
+    /** The disc's own menu (background picture and sound, its buttons): the disc plays as a whole. It needs no titles read first. */
+    private fun mkMenuRow(key: String): JSONObject = JSONObject().put("name", t("Disc mit ihrem Menü abspielen", "Play the disc with its menu")).put("detail", t("Hauptmenü der Disc", "the disc's main menu")).put("icon", "disc")
+        .put("path", "disc:$key|#mkdisc").put("dir", false).put("uri", "makemenu://$key/").put("video", true).put("group", "menu")
+
     private fun mkEntries(key: String, rel: String): List<JSONObject> {
         if (!key.startsWith("usb") || !makemkv.available) return emptyList()
         val out = ArrayList<JSONObject>()
@@ -680,6 +685,7 @@ class MainActivity : Activity() {
         val titles = mkTitles[key]
         if (titles == null) {
             if (rel.isNotEmpty()) return emptyList()
+            out.add(mkMenuRow(key))
             // a protected disc the app cannot open itself: MakeMKV is asked at once (once per disc)
             if (discs.needsMakeMkv(key) && mkKey == null && synchronized(mkReading) { mkReading.add(key) }) {
                 kotlin.concurrent.thread { mkRead(key) { msg -> say(msg) } }
@@ -702,6 +708,7 @@ class MainActivity : Activity() {
         fun play(tt: MakeMkv.Title, label: String, icon: String) = out.add(JSONObject().put("name", label)
             .put("detail", "${tt.minutes} min" + (if (tt.chapters > 1) " · ${tt.chapters} ${t("Kapitel", "chapters")}" else "")).put("icon", icon).put("path", "disc:$key|#mk${tt.id}")
             .put("dir", false).put("uri", "makemkv://$key/${tt.id}").put("video", true).put("group", group))
+        fun menuRow() = out.add(mkMenuRow(key))
         if (rel == "#audio/") return mkTrackEntries(key, "audio")
         if (rel == "#text/") return mkTrackEntries(key, "text")
         if (rel == "#extras/") {
@@ -715,8 +722,7 @@ class MainActivity : Activity() {
         // the episodes follow one another (the page goes on to the next when one ends); the rest stands alone
         group = "episodes"
         // the disc's own menu (background picture and sound, its buttons): the disc plays as a whole
-        out.add(JSONObject().put("name", t("Disc mit ihrem Menü abspielen", "Play the disc with its menu")).put("detail", t("Hauptmenü der Disc", "the disc's main menu")).put("icon", "disc")
-            .put("path", "disc:$key|#mkdisc").put("dir", false).put("uri", "makemenu://$key/").put("video", true).put("group", "menu"))
+        menuRow()
         if (d.kind == "episodes") d.main.forEachIndexed { i, tt ->
             val e = guide?.episodes?.getOrNull(i)
             play(tt, if (e != null) t("Folge ${e.number} · ${e.name}", "Episode ${e.number} · ${e.name}") else "Episode ${i + 1}", "film")
@@ -889,11 +895,12 @@ class MainActivity : Activity() {
     /** Reads the disc's titles with MakeMKV (no playing): the page then lists the film or the episodes. */
     private fun mkRead(key: String, say: (String) -> Unit) {
         if (mkKey != null) { say(t("MakeMKV ist beschäftigt.", "MakeMKV is busy.")); return }
+        mkKey = key
         mkLabel(key)
         mkLog("---- read titles of $key")
         mkReadPlaylists(key)
-        val device = discs.lend(key) ?: run { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); discs.giveBack(key); return }
-        mkKey = key
+        if (mkMenuWanted) { mkLog("the disc's menu is wanted: the titles are not read"); mkKey = null; return }
+        val device = discs.lend(key) ?: run { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); discs.giveBack(key); mkKey = null; return }
         try {
             if (!makemkv.openBridge(device) || !(makemkv.identify() || (makemkv.ejectAndReload() && makemkv.identify()))) {
                 say(t("Das Laufwerk antwortet nicht. Bitte aus- und wieder einschalten.", "The drive does not answer. Switch it off and on again.")); return
@@ -1054,6 +1061,13 @@ class MainActivity : Activity() {
             for (i in 0 until 40) { if (mkMenuState.isEmpty()) break; Thread.sleep(500) }
             mkWantsDrive = false
         }
+        if (mkKey != null) {          // (the titles are being read: the menu does not need them, MakeMKV is stopped and the drive freed)
+            mkLog("the menu is wanted: reading the titles is stopped")
+            mkMenuWanted = true
+            makemkv.stop()
+            for (i in 0 until 40) { if (mkKey == null) break; Thread.sleep(500) }
+            mkMenuWanted = false
+        }
         val closed = java.util.concurrent.CountDownLatch(1)
         main.post { closePlayer(); closed.countDown() }
         closed.await()
@@ -1073,6 +1087,13 @@ class MainActivity : Activity() {
             rb.onSound = { samples, ch -> playPcm(samples, ch) }
             if (!rb.start(if (java.util.Locale.getDefault().language == "de") "ger" else "eng") { mkKey != key }) {
                 say(t("Das Menü der Disc ließ sich nicht öffnen (siehe makemkv-log.txt).", "The disc's menu could not be opened (see makemkv-log.txt)."), 10000)
+                rb.close(); stopMakeMkv(); return
+            }
+            if (rb.keyUnknown) {
+                makemkv.setNoKey(mkLabel(key), true)
+                if (updates.due()) updates.check()
+                say(if (updates.makemkvNewer) t("MakeMKV kennt den Schlüssel dieser Disc nicht. MakeMKV ${updates.makemkvLatest} ist erschienen – damit sollte es gehen.", "MakeMKV does not know this disc's key. MakeMKV ${updates.makemkvLatest} is out – it should work with that.")
+                    else t("MakeMKV kennt den Schlüssel dieser Disc nicht, das Menü lässt sich nicht öffnen. Es gibt noch keine neuere MakeMKV-Version (${updates.makemkvInstalled} ist die aktuelle).", "MakeMKV does not know this disc's key, so the menu cannot be opened. There is no newer MakeMKV yet (${updates.makemkvInstalled} is the latest)."), 14000)
                 rb.close(); stopMakeMkv(); return
             }
             remoteBd = rb
