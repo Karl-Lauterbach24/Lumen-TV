@@ -277,9 +277,19 @@ static int do_sg_io(struct sg_io_hdr *h)
     long ms = (c1.tv_sec - c0.tv_sec) * 1000 + (c1.tv_nsec - c0.tv_nsec) / 1000000;
     const uint8_t *cd = h->cmdp;
     unsigned lba = (cd[0] == 0x28 || cd[0] == 0xa8) ? (unsigned)cd[2] << 24 | cd[3] << 16 | cd[4] << 8 | cd[5] : 0;
-    if (logging >= 3 || (logging >= 1 && st != 0))
+    if (logging >= 3 || (logging >= 1 && st != 0)) {
         LOG("SG_IO cdb %02x lba %u len %u dir %d -> csw %d done %u in %ld ms, sense %x/%02x/%02x", cd[0], lba, len, h->dxfer_direction,
             st, done, ms, key, asc, ascq);
+        /* level 3: the whole command and the start of what the drive answered (not the disc's sectors) */
+        if (logging >= 3 && cd[0] != 0x28 && cd[0] != 0xa8 && cd[0] != 0xbe) {
+            char hex[128], dat[128];
+            int n = 0, m = 0;
+            for (int i = 0; i < h->cmd_len && i < 16; ++i) n += snprintf(hex + n, sizeof(hex) - n, "%02x", cd[i]);
+            if (dir_in && h->dxferp) for (unsigned i = 0; i < done && i < 40; ++i) m += snprintf(dat + m, sizeof(dat) - m, "%02x", ((uint8_t *)h->dxferp)[i]);
+            dat[m] = 0;
+            LOG("   cdb=%s data[%u]=%s", hex, done, dat);
+        }
+    }
     else if (logging >= 1 && ms >= 2000)
         LOG("SG_IO cdb %02x lba %u len %u slow: %ld ms", cd[0], lba, len, ms);
     stat_bytes += done; stat_cmds++;

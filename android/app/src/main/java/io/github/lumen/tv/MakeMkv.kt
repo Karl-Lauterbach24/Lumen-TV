@@ -84,6 +84,18 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
             }
             File(root, ".extracted").writeText("1")
         }
+        // what a Linux needs to talk to a server over TLS and to name localhost: the system's certificates as one bundle (MakeMKV asks its
+        // servers about discs it does not know), /etc/hosts
+        try {
+            val bundle = File(root, "etc/ssl/certs/ca-certificates.crt")
+            if (!bundle.exists()) {
+                bundle.parentFile?.mkdirs()
+                bundle.outputStream().use { o -> File("/system/etc/security/cacerts").listFiles()?.sortedBy { it.name }?.forEach { c -> try { o.write(c.readBytes()); o.write('\n'.code) } catch (_: Exception) { } } }
+                for (alt in listOf("etc/ssl/cert.pem", "etc/pki/tls/certs/ca-bundle.crt")) File(root, alt).apply { parentFile?.mkdirs(); bundle.copyTo(this, true) }
+                log("CA bundle: ${bundle.length() / 1024} KB")
+            }
+            File(root, "etc/hosts").apply { if (!exists()) writeText("127.0.0.1 localhost\n::1 localhost\n") }
+        } catch (e: Exception) { log("CA bundle: $e") }
         for (d in listOf("tmp", "root", "dev")) File(root, d).mkdirs()
         for (n in listOf("sg0", "sr0")) File(root, "dev/$n").apply { if (!exists()) createNewFile() }
     }
@@ -125,10 +137,11 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         pb.environment().apply {
             put("LD_LIBRARY_PATH", nativeDir)
             put("PROOT_LOADER", "$nativeDir/libproot-loader.so")
+            put("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
             put("PROOT_TMP_DIR", File(activity.cacheDir, "prootTmp").apply { mkdirs() }.absolutePath)
             put("HOME", "/root")
             put("GLIBC_TUNABLES", "glibc.pthread.rseq=0")
-            put("MMSHIM_LOG", "1")
+            put("MMSHIM_LOG", if (java.io.File(activity.filesDir, "shimlog").exists()) "3" else "1")
             put("MMSHIM_EXE", "/usr/bin/makemkvcon")   // or makemkvcon takes the loader for itself and misses its data
             putAll(extraEnv)
         }
