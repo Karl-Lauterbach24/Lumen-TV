@@ -462,6 +462,8 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         prefs.edit().putString("disc:$label", o.toString()).apply()
     }
 
+    fun forgetTitles(label: String) { prefs.edit().remove("disc:$label").apply() }
+
     fun hasTitles(label: String) = prefs.contains("disc:$label")
 
     fun loadTitles(label: String): List<Title>? = try {
@@ -660,7 +662,7 @@ class PipeDataSource(private val pipe: PipeStream) : androidx.media3.datasource.
  * drive deliver, so a drive that pauses for a few seconds is not seen by the player. A quarter of the ring
  * keeps what was played (the player may go back that far); the rest is read ahead.
  */
-private const val PIN = 20L shl 20
+private const val PIN_MAX = 48L shl 20
 private const val HEAD_START = 48L shl 20
 private const val STORAGE_RATE = 4L shl 20
 
@@ -669,7 +671,7 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
     private val lock = Object()
     private val mem: java.nio.ByteBuffer? = if (file == null) java.nio.ByteBuffer.allocateDirect(capacity.toInt()) else null
     private val disk: java.nio.channels.FileChannel? = file?.let { java.io.RandomAccessFile(it, "rw").channel }
-    private val keepBehind = capacity / 4
+    private val keepBehind = capacity * 2 / 5
     @Volatile private var written = 0L
     @Volatile private var eof = false
     @Volatile private var closed = false
@@ -680,16 +682,20 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
     private var minAhead = Long.MAX_VALUE
 
     fun ahead(): Long = written - position
+
+    /** The film has only just begun: all of it is still in the cache, so the player can start again from the beginning. */
+    val pinned get() = position < pin - (1L shl 20)
     private var started = false
     private var fillT0 = System.currentTimeMillis()
     private var fillB0 = 0L
     private var holds = 0
     /**
-     * How far the fill may write. While the film has just begun (the first [PIN] bytes) nothing is overwritten:
+     * How far the fill may write. While the film has just begun (the first 48 MB) nothing is overwritten:
      * the player starts again from the beginning when a track is chosen once the tracks are known, and a stream
      * cannot be asked for twice.
      */
-    private fun limit() = if (position < PIN) capacity else position - keepBehind.coerceAtMost(position) + capacity
+    private val pin = minOf(PIN_MAX, capacity * 3 / 4)
+    private fun limit() = if (position < pin) capacity else position - keepBehind.coerceAtMost(position) + capacity
 
     val where get() = if (file == null) "memory" else "storage"
 
@@ -730,6 +736,7 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
                 val n = i.read(buf)
                 if (n < 0) break
                 put(written, buf, n)
+                indexClusters(buf, n)
                 synchronized(lock) { written += n; lock.notifyAll() }
             }
         } catch (e: Exception) {
@@ -737,6 +744,64 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
         } finally {
             synchronized(lock) { eof = true; lock.notifyAll() }
         }
+    }
+
+    // ---- an index of the stream's Matroska clusters (time -> position), so that the player can go back to the one
+    // before the picture it shows (to change a track, or to skip back a few seconds) as long as it is still in the cache
+    private val idxMs = ArrayList<Long>()
+    private val idxPos = ArrayList<Long>()
+    private var tail = ByteArray(0)
+    private var lastCluster = -1L
+    private val CLUSTER = byteArrayOf(0x1f, 0x43, 0xb6.toByte(), 0x75)
+
+    /** Looks for clusters in the [n] bytes just read (written is still the position of their first byte). */
+    private fun indexClusters(buf: ByteArray, n: Int) {
+        val w = ByteArray(tail.size + n)
+        System.arraycopy(tail, 0, w, 0, tail.size)
+        System.arraycopy(buf, 0, w, tail.size, n)
+        val base = written - tail.size
+        var i = 0
+        val last = w.size - 4
+        while (i <= last) {
+            if (w[i] == CLUSTER[0] && w[i + 1] == CLUSTER[1] && w[i + 2] == CLUSTER[2] && w[i + 3] == CLUSTER[3]) {
+                val pos = base + i
+                if (pos > lastCluster) {
+                    if (i + 24 > w.size) break                        // (the rest follows with the next read)
+                    var o = i + 4
+                    val sizeLen = Integer.numberOfLeadingZeros(w[o].toInt() and 0xff) - 24 + 1
+                    o += sizeLen
+                    if (sizeLen in 1..8 && (w[o].toInt() and 0xff) == 0xe7) {            // the timecode, the first element
+                        o += 1
+                        val vLen = Integer.numberOfLeadingZeros(w[o].toInt() and 0xff) - 24 + 1
+                        o += 1
+                        if (vLen == 1) {
+                            var v = 0L
+                            val len = (w[o - 1].toInt() and 0x7f)
+                            for (k in 0 until len.coerceAtMost(8)) v = (v shl 8) or (w[o + k].toLong() and 0xff)
+                            synchronized(lock) { idxMs.add(v); idxPos.add(pos) }
+                        }
+                    }
+                    lastCluster = pos
+                }
+                i += 4
+            } else i++
+        }
+        tail = w.copyOfRange(maxOf(0, w.size - 30), w.size)
+    }
+
+    /** The cluster to start again from for the picture at [timeUs]: the last one before it still in the cache (else the first there is). */
+    fun clusterAtOrBefore(timeUs: Long): Pair<Long, Long>? = synchronized(lock) {
+        if (idxMs.isEmpty()) return null
+        val oldest = maxOf(0L, written - capacity)
+        var best = -1
+        var first = -1
+        for (k in idxMs.indices) {
+            if (idxPos[k] < oldest) continue
+            if (first < 0) first = k
+            if (idxMs[k] * 1000 <= timeUs) best = k else break
+        }
+        val k = if (best >= 0) best else first
+        if (k < 0) null else idxMs[k] * 1000 to idxPos[k]
     }
 
     private fun put(at: Long, b: ByteArray, n: Int) {
@@ -780,8 +845,8 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
         }
         val now = System.currentTimeMillis()
         if (now - tl >= 5000) {
-            stats("stream: played %.1f MB, cache %s %.0f MB ahead (least %.0f MB), MakeMKV held %d×, in %.2f MB/s, out %.2f MB/s".format(java.util.Locale.ROOT,
-                position / 1e6, where, (written - position) / 1e6, minAhead / 1e6, holds,
+            stats("stream: played %.1f MB, cache %s %.0f MB ahead (least %.0f MB), MakeMKV held %d×, %d clusters, in %.2f MB/s, out %.2f MB/s".format(java.util.Locale.ROOT,
+                position / 1e6, where, (written - position) / 1e6, minAhead / 1e6, holds, idxMs.size,
                 (written - lastWritten) / 1e3 / (now - tl), (position - lastPos) / 1e3 / (now - tl)))
             tl = now; lastPos = position; lastWritten = written; minAhead = Long.MAX_VALUE
         }
@@ -797,4 +862,34 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
         try { disk?.close() } catch (_: Exception) { }
         file?.delete()
     }
+}
+
+
+/**
+ * The player's view of MakeMKV's stream: Matroska, and seekable within what the cache holds (see [PipeStream.clusterAtOrBefore]).
+ * Without it the player starts from byte 0 again to change a track, which a stream cannot do.
+ */
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+class LiveMatroska(private val delegate: androidx.media3.extractor.Extractor, private val pipe: PipeStream) : androidx.media3.extractor.Extractor {
+    override fun sniff(input: androidx.media3.extractor.ExtractorInput) = delegate.sniff(input)
+    override fun init(output: androidx.media3.extractor.ExtractorOutput) {
+        delegate.init(object : androidx.media3.extractor.ExtractorOutput {
+            override fun track(id: Int, type: Int) = output.track(id, type)
+            override fun endTracks() = output.endTracks()
+            override fun seekMap(map: androidx.media3.extractor.SeekMap) {
+                output.seekMap(object : androidx.media3.extractor.SeekMap {
+                    override fun isSeekable() = true
+                    override fun getDurationUs() = map.durationUs
+                    override fun getSeekPoints(timeUs: Long): androidx.media3.extractor.SeekMap.SeekPoints {
+                        val c = pipe.clusterAtOrBefore(timeUs)
+                        return androidx.media3.extractor.SeekMap.SeekPoints(
+                            if (c != null) androidx.media3.extractor.SeekPoint(c.first, c.second) else androidx.media3.extractor.SeekPoint.START)
+                    }
+                })
+            }
+        })
+    }
+    override fun read(input: androidx.media3.extractor.ExtractorInput, seekPosition: androidx.media3.extractor.PositionHolder) = delegate.read(input, seekPosition)
+    override fun seek(position: Long, timeUs: Long) = delegate.seek(position, timeUs)
+    override fun release() = delegate.release()
 }

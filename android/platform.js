@@ -88,6 +88,7 @@
       // the audio and subtitle tracks of what plays, and choosing one ("off": no subtitles)
       tracks: function (done) { ask('tracks', undefined, done); },
       track: function (type, id) { N.track(type, id); },
+      tracksClosed: function () { try { N.tracksClosed(); } catch (e) { /* an older app */ } },
       watch: function (cb) { window.__lumenDrivesChanged = cb; }
     },
 

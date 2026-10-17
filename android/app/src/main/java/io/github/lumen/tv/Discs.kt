@@ -391,7 +391,8 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         val extra = extraEntries?.invoke(key, rel).orEmpty()
         if (rel.startsWith("#") && rel != "#more/") return JSONArray().also { a -> extra.forEach { a.put(it) } }
         val own = ownFolder(key, if (rel == "#more/") "" else rel)
-        if (extra.isEmpty() || rel == "#more/") return own
+        if (rel == "#more/") return JSONArray().also { a -> extra.forEach { a.put(it) }; for (i in 0 until own.length()) a.put(own.get(i)) }
+        if (extra.isEmpty()) return own
         val out = JSONArray()
         extra.forEach { out.put(it) }
         // the disc's own entries while MakeMKV handles the disc: only the ones that do not say "cannot" (the rest under "more")
