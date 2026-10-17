@@ -78,6 +78,12 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     // ---- a drive lent to MakeMKV (test): the app lets go of it and does not touch it until it is given back ----
     private val lent = HashSet<String>()
     /** Entries put before a drive's own (MakeMKV's), for the drive's first page. */
+    /** The picture of a disc (a URL), where one is known: shown on the disc card and the disc page. */
+    /** The name of an identified disc ("Doctor Who (2005) · Season 1 · Disc 3"), or "" . */
+    var nameFor: ((key: String) -> String)? = null
+
+    var coverFor: ((key: String, label: String) -> String)? = null
+
     var extraEntries: ((key: String, rel: String) -> List<JSONObject>)? = null
 
     /** A protected Blu-ray this app cannot decrypt itself (its key is not in the key database). */
@@ -375,7 +381,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
                 "makemkv" -> t("von MakeMKV benutzt", "in use by MakeMKV")
                 else -> listOf(d.kind, if (d.encrypted) (if (d.keys != null) t("AACS, Schlüssel bekannt", "AACS, key known") else "AACS") else "").filter { it.isNotEmpty() }.joinToString(" · ")
             }
-            a.put(JSONObject().put("name", d.label).put("path", "disc:${d.key}|").put("detail", detail))
+            a.put(JSONObject().put("name", nameFor?.invoke(d.key).orEmpty().ifEmpty { d.label }).put("path", "disc:${d.key}|").put("detail", detail).put("cover", coverFor?.invoke(d.key, d.label).orEmpty()))
         }
         for (u in unsupported) a.put(JSONObject().put("name", u).put("path", "").put("detail", "").put("off", true))
         return a

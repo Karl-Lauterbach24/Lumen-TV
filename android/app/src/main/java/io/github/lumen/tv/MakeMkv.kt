@@ -39,7 +39,12 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     companion object { var READ_BUFFER_MB = 16 }
 
     /** A stream of a title, from MakeMKV's SINFO: [type] "audio" / "text" / "video", [lang] ISO 639-1 where known. */
-    class Stream(val type: String, val lang: String, val langName: String, val codec: String, val channels: Int)
+    class Stream(val type: String, val lang: String, val langName: String, val codec: String, val channels: Int,
+                 val desc: String = "", val default: Boolean = false, val bitrate: String = "") {
+        /** (MakeMKV calls a forced subtitle track so in its description) */
+        val forced get() = desc.contains("forced", true)
+        val commentary get() = desc.contains("comment", true)
+    }
 
     class Title(val id: Int, val name: String, val durationMs: Long, val size: String, val file: String, val chapters: Int = 0,
                 val streams: List<Stream> = emptyList(), val source: String = "", val segments: List<Int> = emptyList()) {
@@ -181,6 +186,19 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
             log("MakeMKV: the forum cannot be reached ($e)")
         }
     }
+
+    // ---------------------------------------------------------------- the picture of a disc
+    fun cover(label: String): String = prefs.getString("cover:$label", "") ?: ""
+    fun setCover(label: String, url: String) { prefs.edit().putString("cover:$label", url).apply() }
+    var tmdbKey: String
+        get() = prefs.getString("tmdbKey", "") ?: ""
+        set(v) { prefs.edit().putString("tmdbKey", v.trim()).apply() }
+
+    // ---------------------------------------------------------------- the tracks chosen for one disc
+
+    /** The index of the audio / subtitle stream chosen for a disc ("" = by language, "off" = no subtitles). */
+    fun pick(label: String, type: String): String = prefs.getString("pick:$label:$type", "") ?: ""
+    fun setPick(label: String, type: String, v: String) { prefs.edit().putString("pick:$label:$type", v).apply() }
 
     // ---------------------------------------------------------------- audio and subtitles chosen before playing
 
@@ -439,10 +457,12 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         o.put("titles", org.json.JSONArray(titles.map { t ->
             org.json.JSONObject().put("id", t.id).put("name", t.name).put("ms", t.durationMs).put("size", t.size).put("file", t.file)
                 .put("ch", t.chapters).put("src", t.source).put("segs", org.json.JSONArray(t.segments))
-                .put("streams", org.json.JSONArray(t.streams.map { x -> org.json.JSONObject().put("t", x.type).put("l", x.lang).put("n", x.langName).put("c", x.codec).put("ch", x.channels) }))
+                .put("streams", org.json.JSONArray(t.streams.map { x -> org.json.JSONObject().put("t", x.type).put("l", x.lang).put("n", x.langName).put("c", x.codec).put("ch", x.channels).put("d", x.desc).put("df", x.default).put("b", x.bitrate) }))
         }))
         prefs.edit().putString("disc:$label", o.toString()).apply()
     }
+
+    fun hasTitles(label: String) = prefs.contains("disc:$label")
 
     fun loadTitles(label: String): List<Title>? = try {
         val o = org.json.JSONObject(prefs.getString("disc:$label", null) ?: return null)
@@ -452,7 +472,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         (0 until a.length()).map { i ->
             val t = a.getJSONObject(i)
             Title(t.getInt("id"), t.getString("name"), t.getLong("ms"), t.getString("size"), t.getString("file"), t.getInt("ch"),
-                t.getJSONArray("streams").let { sa -> (0 until sa.length()).map { j -> sa.getJSONObject(j).let { x -> Stream(x.getString("t"), x.getString("l"), x.getString("n"), x.getString("c"), x.getInt("ch")) } } },
+                t.getJSONArray("streams").let { sa -> (0 until sa.length()).map { j -> sa.getJSONObject(j).let { x -> Stream(x.getString("t"), x.getString("l"), x.getString("n"), x.getString("c"), x.getInt("ch"), x.optString("d"), x.optBoolean("df"), x.optString("b")) } } },
                 t.getString("src"), t.getJSONArray("segs").let { ga -> (0 until ga.length()).map { ga.getInt(it) } })
         }
     } catch (_: Exception) { null }
@@ -513,6 +533,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         val sinfo = HashMap<Int, java.util.TreeMap<Int, HashMap<Int, String>>>()
         discInfo.clear()
         pipeOutput(p) { l ->
+            if (l.startsWith("SINFO:2,")) log("sinfo $l")   // (the streams of one title, to see what MakeMKV says about them)
             Regex("""SINFO:(\d+),(\d+),(\d+),\d+,"(.*)"""").find(l)?.let {
                 sinfo.getOrPut(it.groupValues[1].toInt()) { java.util.TreeMap() }.getOrPut(it.groupValues[2].toInt()) { HashMap() }[it.groupValues[3].toInt()] = it.groupValues[4]
             }
@@ -529,7 +550,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
                     val type = when (v[1]) { "Audio" -> "audio"; "Subtitles" -> "text"; "Video" -> "video"; else -> v[1].orEmpty().lowercase() }
                     val code = v[3].orEmpty()
                     Stream(type, if (code.isEmpty()) "" else androidx.media3.common.util.Util.normalizeLanguageCode(code) ?: code,
-                        v[4].orEmpty(), v[6] ?: v[7].orEmpty(), v[14]?.toIntOrNull() ?: 0)
+                        v[4].orEmpty(), v[6] ?: v[7].orEmpty(), v[14]?.toIntOrNull() ?: 0, v[30].orEmpty(), v[38] == "d", v[13].orEmpty())
                 }.orEmpty(), a[16].orEmpty(), a[26].orEmpty().split(',').mapNotNull { it.trim().toIntOrNull() })
         }
     }
@@ -639,6 +660,7 @@ class PipeDataSource(private val pipe: PipeStream) : androidx.media3.datasource.
  * drive deliver, so a drive that pauses for a few seconds is not seen by the player. A quarter of the ring
  * keeps what was played (the player may go back that far); the rest is read ahead.
  */
+private const val PIN = 20L shl 20
 private const val HEAD_START = 48L shl 20
 private const val STORAGE_RATE = 4L shl 20
 
@@ -662,7 +684,12 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
     private var fillT0 = System.currentTimeMillis()
     private var fillB0 = 0L
     private var holds = 0
-    private fun limit() = position - keepBehind.coerceAtMost(position) + capacity
+    /**
+     * How far the fill may write. While the film has just begun (the first [PIN] bytes) nothing is overwritten:
+     * the player starts again from the beginning when a track is chosen once the tracks are known, and a stream
+     * cannot be asked for twice.
+     */
+    private fun limit() = if (position < PIN) capacity else position - keepBehind.coerceAtMost(position) + capacity
 
     val where get() = if (file == null) "memory" else "storage"
 
@@ -732,7 +759,7 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
 
     fun seekTo(pos: Long) {
         synchronized(lock) {
-            val oldest = maxOf(0L, written - capacity + 256 * 1024)
+            val oldest = maxOf(0L, written - capacity)
             if (pos < oldest) throw java.io.IOException("the MakeMKV stream is no longer in the cache (asked for $pos, oldest $oldest)")
             position = pos
             lock.notifyAll()
