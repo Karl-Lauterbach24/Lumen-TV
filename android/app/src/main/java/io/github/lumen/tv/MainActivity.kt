@@ -81,6 +81,11 @@ class MainActivity : Activity() {
         mkLog("Lumen TV ${packageManager.getPackageInfo(packageName, 0).versionName}, ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}, " +
             "MakeMKV ${if (makemkv.available) "available (${makemkv.abi})" else "not available on this device"}, key: ${makemkv.keyMode.ifEmpty { "none" }}")
         makemkv.refreshBetaKeyIfDue()
+        makemkv.onVersion = { updates.makemkvInstalled = it }
+        kotlin.concurrent.thread(isDaemon = true) {
+            if (updates.due()) updates.check()
+            announceUpdates()
+        }
         discs.extraEntries = { key, rel -> mkEntries(key, rel) }
         discs.nameFor = { key -> mkDiscName(key) }
         discs.coverFor = { key, label ->
@@ -509,6 +514,26 @@ class MainActivity : Activity() {
         else -> langName(code)
     }
 
+    private val updates by lazy { Updates(this, packageManager.getPackageInfo(packageName, 0).versionName.orEmpty(), ::mkLog) }
+
+    /** One toast per new version found (the app's or MakeMKV's). */
+    private fun announceUpdates() {
+        val p = getSharedPreferences("updates", MODE_PRIVATE)
+        if (updates.appNewer && p.getString("told-app", "") != updates.appLatest) {
+            p.edit().putString("told-app", updates.appLatest).apply()
+            say(t("Lumen TV ${updates.appLatest} ist erschienen (Einstellungen › Updates).", "Lumen TV ${updates.appLatest} is out (Settings › Updates)."), 9000)
+        } else if (updates.makemkvNewer && p.getString("told-mk", "") != updates.makemkvLatest) {
+            p.edit().putString("told-mk", updates.makemkvLatest).apply()
+            say(t("MakeMKV ${updates.makemkvLatest} ist erschienen (Einstellungen › Updates).", "MakeMKV ${updates.makemkvLatest} is out (Settings › Updates)."), 9000)
+        }
+    }
+
+    private fun updateLine(now: String, latest: String, newer: Boolean) = when {
+        latest.isEmpty() -> "$now · " + t("noch nicht geprüft", "not checked yet")
+        newer -> "$now → $latest " + t("verfügbar", "available")
+        else -> "$now · " + t("aktuell", "up to date")
+    }
+
     private fun settingsJson(section: String): String {
         val a = org.json.JSONArray()
         fun item(id: String, label: String, detail: String, icon: String, off: Boolean = false) =
@@ -516,8 +541,16 @@ class MainActivity : Activity() {
         when (section) {
             "" -> {
                 item("playback", t("Wiedergabe", "Playback"), "${langLabel(makemkv.audioLang)} · ${langLabel(makemkv.subLang, t("Untertitel aus", "no subtitles"), t("Untertitel automatisch", "subtitles automatic"))}", "volume")
+                item("updates", "Updates", if (updates.appNewer || updates.makemkvNewer) t("Neue Version verfügbar", "New version available") else if (updates.error.isNotEmpty()) t("Keine Verbindung", "no connection") else t("täglich geprüft", "checked daily"), "refresh")
                 if (makemkv.available) item("disc", t("Disc und MakeMKV", "Disc and MakeMKV"),
                     when (makemkv.keyMode) { "beta" -> t("Beta-Schlüssel", "beta key"); "manual" -> t("eigener Schlüssel", "own key"); else -> t("kein Schlüssel", "no key") }, "disc")
+            }
+            "updates" -> {
+                item("upd-app", "Lumen TV", updateLine(updates.installedAppName(), updates.appLatest, updates.appNewer), "download")
+                if (makemkv.available) item("upd-mk", "MakeMKV", updateLine(updates.makemkvInstalled, updates.makemkvLatest, updates.makemkvNewer), "download")
+                item("upd-check", t("Jetzt nach Updates suchen", "Check for updates now"), if (updates.error.isNotEmpty()) t("Keine Verbindung: ", "No connection: ") + updates.error
+                    else if (updates.checkedAt > 0) t("zuletzt ", "last ") + java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT).format(java.util.Date(updates.checkedAt)) else t("noch nie", "never"), "refresh")
+                item("note", t("Wird nicht selbst installiert", "Not installed by itself"), t("MakeMKV steckt in der App; ein Update der App baust oder lädst du selbst", "MakeMKV is part of the app; you build or download an app update yourself"), "info", true)
             }
             "playback" -> {
                 item("alang", t("Tonsprache", "Audio language"), langLabel(makemkv.audioLang), "volume")
@@ -553,6 +586,17 @@ class MainActivity : Activity() {
             "cache-size" -> makemkv.cacheMb = next(listOf("0", "64", "128", "256", "512", "1024"), makemkv.cacheMb.toString()).toInt()
             "tmdb" -> askText(t("TMDB-Schlüssel (kostenlos auf themoviedb.org)", "TMDB key (free at themoviedb.org)"), "API key", makemkv.tmdbKey) { k -> makemkv.tmdbKey = k; say(t("Gespeichert. Cover erscheinen beim nächsten Erkennen einer Disc.", "Saved. Covers appear the next time a disc is identified.")) }
             "keydb" -> discs.loadKeyDatabase { say(it) }
+            "upd-check", "upd-app", "upd-mk" -> {
+                say(t("Suche nach Updates …", "Looking for updates …"), 3000)
+                val ok = updates.check()
+                say(when {
+                    !ok -> t("Keine Verbindung zu GitHub oder zum MakeMKV-Forum (${updates.error}). Bitte das Netzwerk prüfen und noch einmal versuchen.", "Could not reach GitHub or the MakeMKV forum (${updates.error}). Check the network and try again.")
+                    updates.appNewer || updates.makemkvNewer -> listOfNotNull(
+                        if (updates.appNewer) t("Lumen TV ${updates.appLatest} ist erschienen.", "Lumen TV ${updates.appLatest} is out.") else null,
+                        if (updates.makemkvNewer) t("MakeMKV ${updates.makemkvLatest} ist erschienen.", "MakeMKV ${updates.makemkvLatest} is out.") else null).joinToString(" ")
+                    else -> t("Alles auf dem neuesten Stand.", "Everything is up to date.")
+                }, 8000)
+            }
         }
     }
 
@@ -644,7 +688,8 @@ class MainActivity : Activity() {
                 note(t("Disc wird erkannt …", "Identifying the disc …"), t("etwa eine Minute", "about a minute"), "disc")
             else if (makemkv.noKey(mkLabel(key))) {
                 note(t("MakeMKV kennt den Schlüssel dieser Disc nicht", "MakeMKV does not know this disc's key"),
-                    t("meist eine neue 4K-Disc (AACS 2): MakeMKV hat sie zur Auswertung gesendet; eine neuere MakeMKV-Version löst das", "mostly a new 4K disc (AACS 2): MakeMKV has sent it for analysis; a newer MakeMKV version solves it"), "key")
+                    if (updates.makemkvNewer) t("MakeMKV ${updates.makemkvLatest} ist erschienen – damit sollte es gehen", "MakeMKV ${updates.makemkvLatest} is out – it should work with that")
+                        else t("meist eine neue 4K-Disc (AACS 2): MakeMKV hat sie zur Auswertung gesendet, eine neuere Version löst das", "mostly a new 4K disc (AACS 2): MakeMKV has sent it for analysis, a newer version solves it"), "key")
                 action(t("Noch einmal versuchen", "Try again"), t("liest die Titel, etwa eine Minute", "reads the titles, about a minute"), "mkread", "refresh")
             } else action(t("Disc mit MakeMKV erkennen", "Identify the disc with MakeMKV"), t("liest die Titel, etwa eine Minute", "reads the titles, about a minute"), "mkread", "disc")
             return out
@@ -859,7 +904,9 @@ class MainActivity : Activity() {
             if (titles.isNotEmpty()) { mkTitles[key] = titles; makemkv.saveTitles(mkLabel(key), titles) }
             else if (makemkv.keyUnknown) {
                 makemkv.setNoKey(mkLabel(key), true)
-                say(t("MakeMKV kennt den Schlüssel dieser Disc nicht.", "MakeMKV does not know this disc's key."))
+                if (updates.due()) updates.check()
+                say(if (updates.makemkvNewer) t("MakeMKV kennt den Schlüssel dieser Disc nicht. MakeMKV ${updates.makemkvLatest} ist erschienen – damit sollte es gehen.", "MakeMKV does not know this disc's key. MakeMKV ${updates.makemkvLatest} is out – it should work with that.")
+                    else t("MakeMKV kennt den Schlüssel dieser Disc nicht. Es gibt noch keine neuere MakeMKV-Version (${updates.makemkvInstalled} ist die aktuelle); die Disc wurde zur Auswertung gesendet.", "MakeMKV does not know this disc's key. There is no newer MakeMKV yet (${updates.makemkvInstalled} is the latest); the disc has been sent for analysis."), 12000)
             } else say(t("MakeMKV hat keine Titel gefunden (siehe makemkv-log.txt).", "MakeMKV found no titles (see makemkv-log.txt)."))
             if (titles.isNotEmpty()) makemkv.setNoKey(mkLabel(key), false)
             mkLookup(key, titles)

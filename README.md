@@ -68,6 +68,7 @@ Plug a USB drive or disc drive into the television and open *Disc* or *USB drive
   supported.
 * **Choosing the track**: every audio and subtitle track of a disc, named as the disc's menu names
   it (read from the menu by the app, once per disc), changeable while the film plays.
+* **Updates**: it looks daily for a newer Lumen TV and a newer MakeMKV and says so (it does not install them).
 * **A disc is recognised**: the disc's own cover, the title, season and disc number; episodes in the
   right order with their names (TVmaze), and the next one starts by itself.
 

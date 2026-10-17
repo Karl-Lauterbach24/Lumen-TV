@@ -423,6 +423,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         private set
     /** Called (on makemkvcon's output thread) when the drive got stuck. */
     var onStuck: (() -> Unit)? = null
+    var onVersion: ((String) -> Unit)? = null
 
     private fun pipeOutput(p: Process, onLine: (String) -> Unit = {}) {
         var prg = 0
@@ -433,6 +434,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         try {
             p.inputStream.bufferedReader().forEachLine { l ->
                 onLine(l)
+                if (l.startsWith("MSG:1005")) Regex("MakeMKV v(\\d+\\.\\d+\\.\\d+)").find(l)?.let { onVersion?.invoke(it.groupValues[1]) }
                 if (l.startsWith("MSG:3303")) keyUnknown = true       // "The volume key is unknown for this disc"
                 if (l.startsWith("MSG:2003") && l.contains("TIMEOUT ON LOGICAL UNIT") && ++timeouts == 3) {
                     log("drive: 3 read timeouts: makemkvcon is stopped")
