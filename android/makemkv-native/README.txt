@@ -11,3 +11,16 @@ The loader is relinked: on the Changhong AI PONT (Android 11, kernel 4.9 armv7l)
 ET_EXEC segment at 0x20000000 (lands at 0x26400000 etc.), so proot's stock loader jumps into nothing (signal 11
 for every program). Linked at 0x0e000000 it works:
   clang -o loader loader/loader.o loader/assembly.o -static -nostdlib -Wl,--build-id=none,--image-base=0x0e000000,-z,noexecstack
+
+bdmenu (2026-10-17): the disc's own menu through libbluray, decrypted by libmmbd
+  libudfread 1.1.2 and libbluray 1.3.4 cross-built for armhf in the Lima VM (arm-linux-gnueabihf-gcc, the same
+  -U_TIME_BITS -U_FILE_OFFSET_BITS -D_FILE_OFFSET_BITS=32 -D_TIME_BITS=32 flags as the shim):
+    libudfread: ./configure --host=arm-linux-gnueabihf --prefix=$P --disable-static
+    libbluray:  ./configure --host=arm-linux-gnueabihf --prefix=$P --disable-static --disable-bdjava-jar --without-freetype
+                --without-fontconfig --without-libxml2 --disable-examples --disable-doxygen-doc
+    bdmenu:     arm-linux-gnueabihf-gcc -O2 <flags> -I$P/include -o bdmenu bdmenu/bdmenu.c -L$P/lib -lbluray -ludfread -ldl
+  shipped as jniLibs libbdm001.so (bdmenu), libbdm002.so (libbluray.so.2), libbdm003.so (libudfread.so.0), mapped in
+  assets/makemkv/libmap-armeabi-v7a.txt. libbluray finds libmmbd by LIBAACS_PATH=libmmbd (it appends .so.0); libmmbd
+  starts makemkvcon itself (MAKEMKVCON) and that child needs the drive shim: bdmenu sets LD_PRELOAD from BDM_PRELOAD
+  (the host's own loader must not see it). The shim serves the fake /dev/sg0 as a file (read/pread/lseek via READ(10))
+  and takes a file lock around each command (two processes use the drive).

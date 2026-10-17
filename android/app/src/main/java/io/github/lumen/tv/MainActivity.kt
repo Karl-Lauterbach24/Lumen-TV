@@ -423,7 +423,9 @@ class MainActivity : Activity() {
             val ofType = mkPlaying?.streams?.filter { it.type == type }.orEmpty()
             if (type == "audio" && nth in coreCopies(ofType)) return@forEachIndexed
             val info = ofType.getOrNull(nth)
-            val textLabel = if (type == "text" && ofType.isNotEmpty()) subtitleLabels(ofType).getOrNull(nth) else null
+            val menu = mkKey?.let { mkMenuNamesOf(it) }
+            val textLabel = if (type == "text" && ofType.isNotEmpty()) subtitleLabels(ofType, menu).getOrNull(nth)
+                else if (type == "audio") menu?.audio?.get(nth - coreCopies(ofType).count { it < nth } + 1) else null
             for (i in 0 until g.length) {
                 val f = g.getTrackFormat(i)
                 a.put(JSONObject().put("type", type).put("id", "$gi:$i").put("label", textLabel ?: if (info != null) streamLabel(info) else trackLabel(f))
@@ -594,7 +596,8 @@ class MainActivity : Activity() {
         fun note(name: String, detail: String, icon: String) = out.add(JSONObject().put("name", name).put("detail", detail)
             .put("icon", icon).put("path", "").put("dir", false).put("off", true))
         if (rel == "#more/") return listOf(JSONObject().put("name", t("Menü-Dateien der Disc sichern", "Save the disc's menu files")).put("detail", t("Diagnose: Java-Menü, Metadaten", "diagnostics: Java menu, metadata"))
-            .put("icon", "download").put("path", "disc:$key|#mkdump").put("dir", false).put("action", "mkdump"), JSONObject().put("name", t("Disc neu einlesen", "Read the disc again")).put("detail", t("Titel, Spuren, Folgen", "titles, tracks, episodes"))
+            .put("icon", "download").put("path", "disc:$key|#mkdump").put("dir", false).put("action", "mkdump"),
+            JSONObject().put("name", "Menü ansehen (Test)").put("detail", "Experiment: das Bildmenü der Disc zeichnen lassen").put("icon", "screen").put("path", "disc:$key|#mkmenu").put("dir", false).put("action", "mkmenu"), JSONObject().put("name", t("Disc neu einlesen", "Read the disc again")).put("detail", t("Titel, Spuren, Folgen", "titles, tracks, episodes"))
             .put("icon", "refresh").put("path", "disc:$key|#mkreset").put("dir", false).put("action", "mkreset"))
         if (mkTitles[key] == null) makemkv.loadTitles(mkLabel(key))?.let { mkTitles[key] = it; kotlin.concurrent.thread { mkLookup(key, it) } }
         val titles = mkTitles[key]
@@ -609,6 +612,8 @@ class MainActivity : Activity() {
             else action(t("Disc mit MakeMKV erkennen", "Identify the disc with MakeMKV"), t("liest die Titel, etwa eine Minute", "reads the titles, about a minute"), "mkread", "disc")
             return out
         }
+        if (mkMenuNamesOf(key) == null && !makemkv.menuTried(mkLabel(key)) && mkMenuState.isEmpty() && mkKey == null && discs.udf(key) != null && mkMenuTriggered.add(key))
+            kotlin.concurrent.thread { mkMenuRead(key) }
         val d = makemkv.identify(titles)
         val guide = mkGuide[key]
         var group = ""
@@ -643,6 +648,9 @@ class MainActivity : Activity() {
         if (guide != null && guide.slots > 1)
             action(t("Folgen ${guide.episodes.first().number}–${guide.episodes.last().number}: falsch?", "Episodes ${guide.episodes.first().number}–${guide.episodes.last().number}: wrong?"),
                 t("weiter zur nächsten Zählung", "try the next numbering"), "mkshift", "refresh")
+        if (mkMenuState == key)
+            out.add(JSONObject().put("name", t("Spurnamen werden aus dem Disc-Menü gelesen …", "Reading the track names from the disc's menu …")).put("detail", t("einige Minuten", "a few minutes"))
+                .put("icon", "info").put("path", "").put("dir", false).put("off", true))
         if (d.extras.isNotEmpty())
             out.add(JSONObject().put("name", t("Extras", "Extras")).put("detail", "${d.extras.size}").put("icon", "extra")
                 .put("path", "disc:$key|#extras/").put("dir", true))
@@ -706,6 +714,71 @@ class MainActivity : Activity() {
         return t("$files Dateien gesichert (${bytes / 1024} KB): Android/data/io.github.lumen.tv/files/disc-dump", "$files files saved (${bytes / 1024} KB): Android/data/io.github.lumen.tv/files/disc-dump")
     }
 
+    /** Experiment: lets bdmenu play the disc's menu for a while, logs its events and takes pictures of the menu. */
+    private fun mkMenuProbe(key: String, say: (String) -> Unit) {
+        if (mkKey != null) { say("MakeMKV is busy."); return }
+        mkLabel(key)
+        mkLog("---- menu probe of $key")
+        val device = discs.lend(key) ?: run { say("The drive is gone."); discs.giveBack(key); return }
+        mkKey = key
+        try {
+            if (!makemkv.openBridge(device) || !(makemkv.identify() || (makemkv.ejectAndReload() && makemkv.identify()))) { say("The drive does not answer."); return }
+            say("Menü wird gestartet …")
+            val p = makemkv.startMenu()
+            val out = p.outputStream
+            val t0 = System.currentTimeMillis()
+            val reader = kotlin.concurrent.thread(isDaemon = true) {
+                try { p.inputStream.bufferedReader().forEachLine { l -> mkLog("menu: " + l.take(300)) } } catch (_: java.io.IOException) { }
+            }
+            // (for the experiment: commands arrive in tmp/menu/cmd.txt, one per line, for up to 15 minutes; "quit" ends it)
+            val cmdFile = java.io.File(makemkv.menuDir(), "cmd.txt")
+            var done = 0
+            while (p.isAlive && System.currentTimeMillis() - t0 < 900_000) {
+                Thread.sleep(300)
+                try {
+                    val lines = if (cmdFile.isFile) cmdFile.readLines() else emptyList()
+                    while (done < lines.size) { val l = lines[done++].trim(); if (l.isNotEmpty()) { out.write((l + "\n").toByteArray()); out.flush(); mkLog("menu <- $l") } }
+                } catch (_: Exception) { break }
+            }
+            mkLog("menu probe ends (${if (p.isAlive) "stopped" else "exit " + p.exitValue()})")
+        } catch (e: Throwable) {
+            mkLog("menu probe failed: ${android.util.Log.getStackTraceString(e)}")
+        } finally {
+            stopMakeMkv()
+        }
+    }
+
+    // ---- the names of the tracks, read from the disc's own menu (see MenuReader) ----
+    private val mkMenuNames = HashMap<String, MenuReader.Names>()
+    @Volatile private var mkMenuState = ""            // the key of the disc whose menu is being read
+
+    private fun mkMenuNamesOf(key: String): MenuReader.Names? =
+        mkMenuNames[key] ?: makemkv.menuNames(mkLabel(key))?.let { MenuReader.Names.fromJson(it) }?.also { mkMenuNames[key] = it }
+
+    /** Reads the menu of the disc [key] (once per disc, remembered): runs on a worker thread, gives up when a film is to be played. */
+    private fun mkMenuRead(key: String) {
+        if (mkMenuState.isNotEmpty() || mkKey != null || mkMenuNamesOf(key) != null || makemkv.menuTried(mkLabel(key))) return
+        mkMenuState = key
+        js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
+        mkLog("---- read the menu of $key")
+        val device = discs.lend(key)
+        mkKey = key
+        try {
+            if (device == null || !makemkv.openBridge(device) || !(makemkv.identify() || (makemkv.ejectAndReload() && makemkv.identify()))) { mkLog("menu: the drive does not answer"); return }
+            val stn = mkStn[key]?.let { m -> makemkv.identify(mkTitles[key] ?: emptyList()).main.firstOrNull()?.source?.let { m[it] } }
+            val names = MenuReader(makemkv) { mkLog(it) }.read(stn?.audio?.map { it.lang } ?: emptyList(), stn?.subtitles?.map { it.lang } ?: emptyList()) { mkKey != key || mkWantsDrive }
+            makemkv.setMenuTried(mkLabel(key))
+            if (names != null) { makemkv.saveMenuNames(mkLabel(key), names.toJson()); mkMenuNames[key] = names }
+        } catch (e: Throwable) {
+            mkLog("menu: failed: ${android.util.Log.getStackTraceString(e)}")
+        } finally {
+            mkMenuState = ""
+            stopMakeMkv()
+            js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
+        }
+    }
+    @Volatile private var mkWantsDrive = false
+
     /** The playlists' stream tables, read from the disc itself before MakeMKV has the drive (key -> playlist name -> table). */
     private val mkStn = HashMap<String, Map<String, StreamTable>>()
 
@@ -746,13 +819,18 @@ class MainActivity : Activity() {
             if (titles.isNotEmpty()) { mkTitles[key] = titles; makemkv.saveTitles(mkLabel(key), titles) }
             else say(t("MakeMKV hat keine Titel gefunden (siehe makemkv-log.txt).", "MakeMKV found no titles (see makemkv-log.txt)."))
             mkLookup(key, titles)
+            if (titles.isNotEmpty()) mkAfterRead = key
         } catch (e: Throwable) {
             mkLog("failed: ${android.util.Log.getStackTraceString(e)}")
         } finally {
             stopMakeMkv()
             js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
         }
+        // then the disc's menu: the names of the tracks
+        if (mkAfterRead == key) { mkAfterRead = ""; mkMenuRead(key) }
     }
+    @Volatile private var mkAfterRead = ""
+    private val mkMenuTriggered = HashSet<String>()
 
     /** A series disc: the names of its episodes from TVmaze (only the series' name is sent). */
     private fun mkLookup(key: String, titles: List<MakeMkv.Title>) {
@@ -815,12 +893,12 @@ class MainActivity : Activity() {
      * The subtitle tracks of a disc: MakeMKV adds, after a stream, a "forced only" copy of it where the stream holds forced
      * subtitles. "Subtitles 2 · German" and "Subtitles 2 · German · only forced parts".
      */
-    private fun subtitleLabels(streams: List<MakeMkv.Stream>): List<String> {
+    private fun subtitleLabels(streams: List<MakeMkv.Stream>, names: MenuReader.Names? = null): List<String> {
         var k = 0
         return streams.map { x ->
             val lang = if (x.lang.isNotEmpty()) langName(x.lang) else x.langName
-            if (x.forced) "${t("Untertitel", "Subtitles")} ${maxOf(k, 1)} · $lang · ${t("nur erzwungene Teile", "only forced parts")}"
-            else "${t("Untertitel", "Subtitles")} ${++k} · $lang"
+            if (x.forced) (names?.text?.get(maxOf(k, 1)) ?: "${t("Untertitel", "Subtitles")} ${maxOf(k, 1)} · $lang") + " · ${t("nur erzwungene Teile", "only forced parts")}"
+            else { k++; names?.text?.get(k) ?: "${t("Untertitel", "Subtitles")} $k · $lang" }
         }
     }
 
@@ -850,7 +928,8 @@ class MainActivity : Activity() {
         val streams = mkStreams(key, type)
         val hidden = if (type == "audio") coreCopies(streams) else emptySet()
         val shown = streams.indices.filter { it !in hidden }
-        val labels = if (type == "text") subtitleLabels(streams) else numbered(shown.map { streamLabel(streams[it]) })
+        val names = mkMenuNamesOf(key)
+        val labels = if (type == "text") subtitleLabels(streams, names) else numbered(shown.mapIndexed { n, i -> names?.audio?.get(n + 1) ?: streamLabel(streams[i]) })
         shown.forEachIndexed { n, i -> row(labels[n], "", i.toString(), now == i.toString(), icon) }
         return out
     }
@@ -880,6 +959,11 @@ class MainActivity : Activity() {
     private fun startMakeMkv(uri: Uri) {
         val key = uri.host ?: return
         val which = uri.path.orEmpty().trim('/')
+        if (mkMenuState.isNotEmpty()) {          // the menu is being read: the film comes first
+            mkWantsDrive = true; makemkv.stop()
+            for (i in 0 until 40) { if (mkMenuState.isEmpty()) break; Thread.sleep(500) }
+            mkWantsDrive = false
+        }
         val closed = java.util.concurrent.CountDownLatch(1)
         main.post { closePlayer(); closed.countDown() }
         closed.await()
@@ -1077,8 +1161,9 @@ class MainActivity : Activity() {
                     "#mkread" -> mkRead(key, say)
                     "#mkshift" -> mkShift(key)
                     "#mkdump" -> say(dumpMenuFiles(key))
+                    "#mkmenu" -> mkMenuProbe(key, say)
                     "#mkreset" -> {
-                        makemkv.forgetTitles(mkLabel(key)); mkTitles.remove(key); mkGuide.remove(key); mkStn.remove(key)
+                        makemkv.forgetTitles(mkLabel(key)); mkTitles.remove(key); mkGuide.remove(key); mkStn.remove(key); mkMenuNames.remove(key); mkMenuTriggered.remove(key)
                         synchronized(mkReading) { mkReading.remove(key) }
                         js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
                     }

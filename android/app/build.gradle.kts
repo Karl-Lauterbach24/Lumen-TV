@@ -70,5 +70,8 @@ dependencies {
     // Dolby, DTS and TrueHD decoded by the app (see libs/README.md)
     implementation(files("libs/media3-decoder-ffmpeg-1.5.1.aar"))
     implementation("org.apache.commons:commons-compress:1.26.1")
+    // text recognition for the menu reader: only in builds that carry MakeMKV's files (it is looked up by name, see MenuReader)
+    if (file("src/main/jniLibs/armeabi-v7a/libbdm001.so").exists() || file("src/main/jniLibs/arm64-v8a/libbdm001.so").exists())
+        implementation("com.google.mlkit:text-recognition:16.0.1")
     testImplementation("junit:junit:4.13.2")
 }

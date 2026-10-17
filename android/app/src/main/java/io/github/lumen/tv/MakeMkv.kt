@@ -112,14 +112,14 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         link(File(dev, "generic"), "scsi_generic/sg0")
     }
 
-    private fun command(args: List<String>, extraEnv: Map<String, String>): ProcessBuilder {
+    private fun command(args: List<String>, extraEnv: Map<String, String>, program: String = "/usr/bin/makemkvcon"): ProcessBuilder {
         val cmd = arrayListOf("$nativeDir/libproot.so", "--kill-on-exit", "-0", "-r", root.absolutePath, "-b", "/proc")
         for (n in listOf("null", "zero", "random", "urandom")) { cmd += "-b"; cmd += "/dev/$n" }
         for ((lib, guest) in libmap()) { File(root, guest.trimStart('/')).parentFile?.mkdirs(); cmd += "-b"; cmd += "$nativeDir/$lib:$guest" }
         cmd += listOf("-b", "$nativeDir/libmmshim.so:/usr/lib/libmmshim.so")
         // through glibc's loader: the 32-bit build cannot be started directly under proot
         val ld = if (abi == "arm64-v8a") "/lib/ld-linux-aarch64.so.1" else "/lib/ld-linux-armhf.so.3"
-        cmd += listOf(ld, "--preload", "/usr/lib/libmmshim.so", "/usr/bin/makemkvcon")
+        cmd += listOf(ld, "--preload", "/usr/lib/libmmshim.so", program)
         cmd += args
         val pb = ProcessBuilder(cmd).redirectErrorStream(true)
         pb.environment().apply {
@@ -462,7 +462,13 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         prefs.edit().putString("disc:$label", o.toString()).apply()
     }
 
-    fun forgetTitles(label: String) { prefs.edit().remove("disc:$label").apply() }
+    // the names a disc's menu gives its tracks (JSON, see MenuReader.Names); "tried": the menu has been looked at (found or not)
+    fun menuNames(label: String): String? = prefs.getString("menu:$label", null)
+    fun saveMenuNames(label: String, json: String) { prefs.edit().putString("menu:$label", json).apply() }
+    fun menuTried(label: String) = prefs.getBoolean("menutried:$label", false)
+    fun setMenuTried(label: String) { prefs.edit().putBoolean("menutried:$label", true).apply() }
+
+    fun forgetTitles(label: String) { prefs.edit().remove("disc:$label").remove("menu:$label").remove("menutried:$label").apply() }
 
     fun hasTitles(label: String) = prefs.contains("disc:$label")
 
@@ -623,6 +629,16 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     private fun pidOf(p: Process): Int = try {
         p.javaClass.getDeclaredField("pid").apply { isAccessible = true }.getInt(p)
     } catch (_: Exception) { -1 }
+
+    /** bdmenu (see makemkv-native/bdmenu): plays the disc's menu through libbluray and libmmbd; its stdout is the menu's events. */
+    fun startMenu(): Process {
+        File(root, "tmp/menu").apply { listFiles()?.forEach { it.delete() }; mkdirs() }
+        val p = command(listOf("/dev/sg0", "/tmp/menu"), mapOf("LIBAACS_PATH" to "libmmbd", "LIBBDPLUS_PATH" to "libmmbd", "MAKEMKVCON" to "/usr/bin/makemkvcon", "BDM_PRELOAD" to "/usr/lib/libmmshim.so", "MMBD_TRACE" to "1"), "/usr/bin/bdmenu").start()
+        proc = p
+        return p
+    }
+
+    fun menuDir(): File = File(root, "tmp/menu")
 
     fun stop() {
         proc?.destroy(); proc = null

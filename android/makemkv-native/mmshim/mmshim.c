@@ -29,6 +29,7 @@
 #include <dirent.h>
 #include <time.h>
 #include <linux/usbdevice_fs.h>
+#include <sys/file.h>
 #include <poll.h>
 
 #define SOCKET_NAME "lumen.mmshim.usb"
@@ -161,8 +162,22 @@ static void reset_recovery(void)
     clear_halt(ep_out);
 }
 
+/*
+ * Several processes may use the drive at once (libmmbd's helper and the player of a menu): each command (the three bulk
+ * transfers of a Bulk-Only Transport command) holds a file lock shared by all of them.
+ */
+static int xlock_fd = -2;
+static void xlock(int on)
+{
+    if (xlock_fd == -2) {
+        int (*real_open)(const char *, int, ...) = dlsym(RTLD_NEXT, "open");
+        xlock_fd = real_open("/tmp/.mmshim.lock", O_RDWR | O_CREAT, 0600);
+    }
+    if (xlock_fd >= 0) flock(xlock_fd, on ? LOCK_EX : LOCK_UN);
+}
+
 /* one Bulk-Only Transport command; returns CSW status (0 ok, 1 failed, 2 phase error) or -1 */
-static int bot(const uint8_t *cdb, int cdb_len, int dir_in, uint8_t *data, unsigned len,
+static int bot_locked(const uint8_t *cdb, int cdb_len, int dir_in, uint8_t *data, unsigned len,
                unsigned timeout_ms, unsigned *done)
 {
     uint8_t cbw[31];
@@ -205,6 +220,14 @@ static int bot(const uint8_t *cdb, int cdb_len, int dir_in, uint8_t *data, unsig
     }
     if (csw[12] == 2) reset_recovery();
     return csw[12];
+}
+
+static int bot(const uint8_t *cdb, int cdb_len, int dir_in, uint8_t *data, unsigned len, unsigned timeout_ms, unsigned *done)
+{
+    xlock(1);
+    int r = bot_locked(cdb, cdb_len, dir_in, data, len, timeout_ms, done);
+    xlock(0);
+    return r;
 }
 
 static int do_sg_io(struct sg_io_hdr *h)
@@ -279,6 +302,7 @@ static int do_sg_io(struct sg_io_hdr *h)
 static unsigned char ours[MAXFD];
 
 static int is_ours(int fd) { return fd >= 0 && fd < MAXFD && ours[fd]; }
+static long long devpos[MAXFD];      /* the read position of the fake drive when read as a file */
 
 static void fake_stat(struct stat64 *st)
 {
@@ -347,7 +371,7 @@ int open64(const char *path, int flags, ...)
 int close(int fd)
 {
     resolve();
-    if (is_ours(fd)) ours[fd] = 0;
+    if (is_ours(fd)) { ours[fd] = 0; devpos[fd] = 0; }
     if (fd >= 0 && fd < 1024 && outfd[fd]) { outfd[fd] = 0; LOG("OUT close(%d)", fd); }
     if (fd >= 0 && fd < 1024 && streamfd[fd]) { streamfd[fd] = 0; LOG("STREAM close(%d) after %lld bytes", fd, stream_pos[fd]); }
     return real_close(fd);
@@ -575,10 +599,88 @@ ssize_t write(int fd, const void *buf, size_t n)
     return r;
 }
 
+/*
+ * The fake drive as a file: reading the disc's sectors (libbluray and libudfread open the device and read it like a file).
+ * A read is READ(10) over the same bulk transfers as SG_IO.
+ */
+static long long devsize = -1;
+
+static long long dev_size(void)
+{
+    if (devsize >= 0) return devsize;
+    uint8_t cdb[10] = { 0x25 }, d[8] = { 0 };
+    unsigned done = 0;
+    pthread_mutex_lock(&lock);
+    int st = bot(cdb, 10, 1, d, 8, 5000, &done);
+    pthread_mutex_unlock(&lock);
+    if (st != 0 || done < 8) return 0;
+    uint32_t last = (uint32_t)d[0] << 24 | d[1] << 16 | d[2] << 8 | d[3];
+    uint32_t bs = (uint32_t)d[4] << 24 | d[5] << 16 | d[6] << 8 | d[7];
+    devsize = ((long long)last + 1) * bs;
+    LOG("device size %lld bytes", devsize);
+    return devsize;
+}
+
+static ssize_t dev_read(void *vbuf, size_t n, long long pos)
+{
+    uint8_t *buf = vbuf;
+    size_t got = 0;
+    long long size = dev_size();
+    if (pos >= size) return 0;
+    if ((long long)n > size - pos) n = (size_t)(size - pos);
+    static uint8_t blocks[32 * 2048];
+    while (got < n) {
+        long long lba = (pos + got) / 2048;
+        size_t skip = (size_t)((pos + got) % 2048);
+        unsigned count = (unsigned)((skip + (n - got) + 2047) / 2048);
+        if (count > 32) count = 32;
+        uint8_t cdb[10] = { 0x28, 0, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba, 0, (uint8_t)(count >> 8), (uint8_t)count, 0 };
+        unsigned done = 0;
+        pthread_mutex_lock(&lock);
+        int st = bot(cdb, 10, 1, blocks, count * 2048, 30000, &done);
+        pthread_mutex_unlock(&lock);
+        if (st != 0 && done == 0) { if (got) break; errno = EIO; return -1; }
+        size_t avail = done > skip ? done - skip : 0;
+        size_t take = avail < n - got ? avail : n - got;
+        if (!take) break;
+        memcpy(buf + got, blocks + skip, take);
+        got += take;
+        if (done < count * 2048) break;
+    }
+    return (ssize_t)got;
+}
+
+ssize_t read(int fd, void *buf, size_t n)
+{
+    static ssize_t (*real)(int, void *, size_t);
+    if (!real) real = dlsym(RTLD_NEXT, "read");
+    if (is_ours(fd)) {
+        if (connect_app() < 0) { errno = ENODEV; return -1; }
+        ssize_t r = dev_read(buf, n, devpos[fd]);
+        if (r > 0) devpos[fd] += r;
+        return r;
+    }
+    return real(fd, buf, n);
+}
+
+ssize_t pread64(int fd, void *buf, size_t n, off64_t off);
+ssize_t pread64(int fd, void *buf, size_t n, off64_t off)
+{
+    static ssize_t (*real)(int, void *, size_t, off64_t);
+    if (!real) real = dlsym(RTLD_NEXT, "pread64");
+    if (is_ours(fd)) return dev_read(buf, n, off);
+    return real(fd, buf, n, off);
+}
+
 off64_t lseek64(int fd, off64_t off, int whence)
 {
     static off64_t (*real)(int, off64_t, int);
     if (!real) real = dlsym(RTLD_NEXT, "lseek64");
+    if (is_ours(fd)) {
+        long long np = whence == SEEK_CUR ? devpos[fd] + off : whence == SEEK_END ? dev_size() + off : off;
+        if (np < 0) { errno = EINVAL; return -1; }
+        return devpos[fd] = np;
+    }
     if (is_streamfd(fd)) return whence == SEEK_CUR ? stream_pos[fd] + off : whence == SEEK_SET ? off : stream_pos[fd];
     off64_t r = real(fd, off, whence);
     if (is_outfd(fd)) LOG("OUT lseek64(%d, %lld, %d) = %lld", fd, (long long)off, whence, (long long)r);
@@ -615,6 +717,6 @@ off_t lseek(int fd, off_t off, int whence)
 {
     static off_t (*real)(int, off_t, int);
     if (!real) real = dlsym(RTLD_NEXT, "lseek");
-    if (is_streamfd(fd)) return (off_t)lseek64(fd, off, whence);
+    if (is_streamfd(fd) || is_ours(fd)) return (off_t)lseek64(fd, off, whence);
     return real(fd, off, whence);
 }
