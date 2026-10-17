@@ -306,9 +306,7 @@ class MainActivity : Activity() {
             val b = bd ?: return
             val factory = BdDataSource.Factory(b) { type, value -> bdEvent(type, value) }
             val extractors = androidx.media3.extractor.DefaultExtractorsFactory()
-                .setTsExtractorFlags(androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
-                    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS or
-                    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
+                .setTsExtractorFlags(BLURAY_TS_FLAGS)
                 .setConstantBitrateSeekingEnabled(false)
             val source = androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(factory, extractors)
                 .createMediaSource(MediaItem.fromUri(uri))
@@ -316,9 +314,7 @@ class MainActivity : Activity() {
         } else if (uri.scheme == "makemenu") {
             val rb = remoteBd ?: return
             val extractors = androidx.media3.extractor.DefaultExtractorsFactory()
-                .setTsExtractorFlags(androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
-                    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS or
-                    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
+                .setTsExtractorFlags(BLURAY_TS_FLAGS)
                 .setConstantBitrateSeekingEnabled(false)
             val source = androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(FifoDataSource.Factory(rb.fifo), extractors)
                 .createMediaSource(MediaItem.fromUri(uri))
@@ -327,7 +323,7 @@ class MainActivity : Activity() {
             // a file of a disc the app reads itself
             val factory = DiscDataSource.Factory { key, path -> discs.reader(key, path) }
             // a Blu-ray title: the length and seeking from the stream's clock (see BdavSeek)
-            val extractors: androidx.media3.extractor.ExtractorsFactory = prepared ?: androidx.media3.extractor.DefaultExtractorsFactory()
+            val extractors: androidx.media3.extractor.ExtractorsFactory = prepared ?: androidx.media3.extractor.DefaultExtractorsFactory().setTsExtractorFlags(BLURAY_TS_FLAGS)
             val source = androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(factory, extractors)
                 .createMediaSource(MediaItem.fromUri(uri))
             p.setMediaSource(source)
@@ -661,6 +657,28 @@ class MainActivity : Activity() {
         return if (guide != null && d.name.isNotEmpty()) base.replaceFirst(d.name, guide.show + (guide.premiered.take(4).takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: "")) else base
     }
     @Volatile private var mkMenuWanted = false
+    private val mkLibreTriggered = HashSet<String>()
+
+    /** Switches LibreDrive on in the drive of [key] through MakeMKV (a 4K disc the app then decrypts itself with the key database). */
+    private fun mkLibre(key: String) {
+        if (mkKey != null) return
+        mkKey = key
+        mkLog("---- LibreDrive for $key")
+        js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
+        try {
+            val device = discs.lend(key) ?: run { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); return }
+            if (!makemkv.openBridge(device) || !(makemkv.identify() || (makemkv.ejectAndReload() && makemkv.identify()))) {
+                say(t("Das Laufwerk antwortet nicht. Bitte aus- und wieder einschalten.", "The drive does not answer. Switch it off and on again.")); return
+            }
+            if (makemkv.enableLibreDrive()) discs.libreReady.add(key)
+            else say(t("MakeMKV konnte LibreDrive nicht einschalten – dieses Laufwerk kann 4K-Discs so nicht lesen.", "MakeMKV could not switch LibreDrive on – this drive cannot read 4K discs this way."), 10000)
+        } catch (e: Throwable) {
+            mkLog("LibreDrive failed: ${android.util.Log.getStackTraceString(e)}")
+        } finally {
+            stopMakeMkv()
+            js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
+        }
+    }
     private val mkReading = HashSet<String>()      // discs MakeMKV is reading (or has been asked to, once)
 
     /** What the disc page of the drive [key] shows besides the disc's own files; [rel] "" is the page, "#extras/" the extras. */
@@ -685,6 +703,13 @@ class MainActivity : Activity() {
         val titles = mkTitles[key]
         if (titles == null) {
             if (rel.isNotEmpty()) return emptyList()
+            // a 4K disc the key database knows: MakeMKV only switches LibreDrive on, the app plays it itself
+            if (discs.needsLibreDrive(key)) {
+                if (mkKey == null && synchronized(mkLibreTriggered) { mkLibreTriggered.add(key) }) kotlin.concurrent.thread { mkLibre(key) }
+                if (mkKey == key) note(t("4K-Disc wird vorbereitet …", "Preparing the 4K disc …"), t("MakeMKV schaltet LibreDrive ein, etwa zwei Minuten", "MakeMKV switches LibreDrive on, about two minutes"), "disc")
+                else action(t("4K-Disc vorbereiten", "Prepare the 4K disc"), t("LibreDrive über MakeMKV einschalten", "switch LibreDrive on through MakeMKV"), "mklibre", "disc")
+                return out
+            }
             out.add(mkMenuRow(key))
             // a protected disc the app cannot open itself: MakeMKV is asked at once (once per disc)
             if (discs.needsMakeMkv(key) && mkKey == null && synchronized(mkReading) { mkReading.add(key) }) {
@@ -942,7 +967,12 @@ class MainActivity : Activity() {
             }
             return
         }
-        val r = EpisodeGuide.lookup(d.name, d.season, d.discNo, d.main.map { it.minutes }, episodeShift(d)) { mkLog(it) } ?: return
+        // (kept per disc and numbering: TVmaze is asked once, not at every start)
+        val prefs = getSharedPreferences("makemkv", MODE_PRIVATE)
+        val cacheKey = "guide:${mkLabel(key)}:${episodeShift(d)}:${d.main.size}"
+        val r = EpisodeGuide.fromJson(prefs.getString(cacheKey, null))?.takeIf { it.episodes.size == d.main.size }
+            ?: EpisodeGuide.lookup(d.name, d.season, d.discNo, d.main.map { it.minutes }, episodeShift(d)) { mkLog(it) }?.also { prefs.edit().putString(cacheKey, EpisodeGuide.toJson(it)).apply() }
+            ?: return
         mkLog("episodes: ${r.show} (${r.premiered}): " + r.episodes.joinToString(" | ") { "${it.season}x${it.number} ${it.name}" })
         mkGuide[key] = r
         if (r.image.isNotEmpty() && makemkv.cover(mkLabel(key)) != r.image) makemkv.setCover(mkLabel(key), r.image)
@@ -1097,6 +1127,11 @@ class MainActivity : Activity() {
                 rb.close(); stopMakeMkv(); return
             }
             remoteBd = rb
+            // (bdmenu stopping by itself – the disc could not be read on, a menu it cannot run – leaves no empty player behind)
+            rb.onEnded = { main.post { if (remoteBd === rb) {
+                event("ended"); closePlayer()
+                say(t("Die Wiedergabe mit dem Menü der Disc ist beendet (siehe makemkv-log.txt).", "Playing the disc with its menu has ended (see makemkv-log.txt)."), 9000)
+            } } }
             say("", 1)
             main.post { bdOverlay.visibility = View.VISIBLE; open(uri, false, null) }
         } catch (e: Throwable) {
@@ -1352,6 +1387,7 @@ class MainActivity : Activity() {
                     "#keys" -> discs.loadKeyDatabase(say)
                     "#info" -> say(discs.keyInfo(key, true))
                     "#mkread" -> mkRead(key, say)
+                    "#mklibre" -> { synchronized(mkLibreTriggered) { mkLibreTriggered.add(key) }; mkLibre(key) }
                     "#mkshift" -> mkShift(key)
                     "#mkdump" -> say(dumpMenuFiles(key))
                     "#mkmenu" -> mkMenuProbe(key, say)

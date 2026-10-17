@@ -55,10 +55,20 @@ object BdavSeek {
     }
 }
 
+/** How a Blu-ray's transport stream is read (see [ProportionalTsExtractor]). */
+@UnstableApi
+val BLURAY_TS_FLAGS = androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
+    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS or
+    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS or
+    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_IGNORE_SPLICE_INFO_STREAM
+
 /** A transport-stream extractor whose seek map is the proportion of the file, for a known length. */
 @UnstableApi
 class ProportionalTsExtractor(private val durationUs: Long, private val size: Long) : Extractor {
-    private val inner = TsExtractor()
+    // a Blu-ray's stream types: 0x86 is DTS-HD Master Audio there, not SCTE-35 splice information (which Media3 would parse and fail on)
+    @Suppress("DEPRECATION")
+    private val inner = TsExtractor(TsExtractor.MODE_SINGLE_PMT, androidx.media3.common.util.TimestampAdjuster(0),
+        androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory(BLURAY_TS_FLAGS))
 
     override fun sniff(input: ExtractorInput): Boolean = inner.sniff(input)
 

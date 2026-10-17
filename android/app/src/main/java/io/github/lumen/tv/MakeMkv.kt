@@ -555,6 +555,25 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     }
 
     /** The disc's titles (makemkvcon info). */
+    /**
+     * Lets MakeMKV switch the drive's LibreDrive mode on (a whole run of "info", about two minutes): afterwards the drive hands out
+     * a 4K disc's sectors without bus encryption, so the app can decrypt them itself with keys from the key database.
+     */
+    fun enableLibreDrive(): Boolean {
+        val p = command(listOf("-r", "info", "disc:0"), emptyMap()).start()
+        proc = p
+        var on = false
+        val t0 = System.currentTimeMillis()
+        pipeOutput(p) { l ->
+            if (l.startsWith("MSG:1011") && l.contains("LibreDrive")) on = true
+            // (MakeMKV is not stopped early: killed in the middle of a command it leaves the drive hanging)
+        }
+        try { p.waitFor() } catch (_: Exception) { }
+        proc = null
+        log("LibreDrive: ${if (on) "on" else "not reported"} after ${(System.currentTimeMillis() - t0) / 1000} s")
+        return on
+    }
+
     fun titles(): List<Title> {
         val t0 = System.currentTimeMillis()
         val p = command(listOf("-r", "--cache=16", "info", "disc:0"), emptyMap()).start()

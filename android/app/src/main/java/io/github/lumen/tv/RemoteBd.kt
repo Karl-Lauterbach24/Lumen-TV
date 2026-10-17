@@ -22,6 +22,9 @@ class RemoteBd(private val makemkv: MakeMkv, private val log: (String) -> Unit) 
     var onSound: ((samples: ShortArray, channels: Int) -> Unit)? = null
     /** MakeMKV's library said it does not know the disc's key (a disc it cannot decrypt). */
     @Volatile var keyUnknown = false
+    /** bdmenu has ended by itself (not through [close]). */
+    var onEnded: (() -> Unit)? = null
+    @Volatile private var closing = false
     @Volatile var opened = false
         private set
 
@@ -51,8 +54,10 @@ class RemoteBd(private val makemkv: MakeMkv, private val log: (String) -> Unit) 
                 }
             } catch (_: java.io.IOException) { }
             log("bdmenu ended (exit ${try { p.waitFor(2, TimeUnit.SECONDS); p.exitValue() } catch (_: Exception) { -1 }}), last lines: ${last.joinToString(" | ")}")
+            val was = opened
             opened = false
             ready.countDown()
+            if (was && !closing) onEnded?.invoke()
         }
         while (!ready.await(500, TimeUnit.MILLISECONDS)) { if (stop() || !p.isAlive) break }
         return opened
@@ -91,6 +96,7 @@ class RemoteBd(private val makemkv: MakeMkv, private val log: (String) -> Unit) 
     fun menu() { try { process?.outputStream?.let { it.write("menu\n".toByteArray()); it.flush() } } catch (_: Exception) { } }
 
     fun close() {
+        closing = true
         opened = false
         try { process?.outputStream?.let { it.write("quit\n".toByteArray()); it.flush() } } catch (_: Exception) { }
         makemkv.stop()

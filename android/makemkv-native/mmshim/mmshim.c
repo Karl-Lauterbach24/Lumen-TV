@@ -730,3 +730,112 @@ off_t lseek(int fd, off_t off, int whence)
     if (is_streamfd(fd) || is_ours(fd)) return (off_t)lseek64(fd, off, whence);
     return real(fd, off, whence);
 }
+
+/* ---- network (diagnostics, level 3): what makemkvcon asks of the network and whether it gets through ---- */
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
+static void net_addr(const struct sockaddr *a, char *out, size_t n, int *port)
+{
+    *port = 0; snprintf(out, n, "?");
+    if (!a) return;
+    if (a->sa_family == AF_INET) { const struct sockaddr_in *s = (const void *)a; inet_ntop(AF_INET, &s->sin_addr, out, n); *port = ntohs(s->sin_port); }
+    else if (a->sa_family == AF_INET6) { const struct sockaddr_in6 *s = (const void *)a; inet_ntop(AF_INET6, &s->sin6_addr, out, n); *port = ntohs(s->sin6_port); }
+}
+
+int connect(int fd, const struct sockaddr *a, socklen_t l)
+{
+    static int (*rc)(int, const struct sockaddr *, socklen_t);
+    if (!rc) rc = dlsym(RTLD_NEXT, "connect");
+    int r = rc(fd, a, l), e = errno;
+    init_log();
+    if (logging >= 3 && a && (a->sa_family == AF_INET || a->sa_family == AF_INET6)) {
+        char h[64]; int port;
+        net_addr(a, h, sizeof(h), &port);
+        LOG("net: connect fd %d to %s:%d -> %d%s%s", fd, h, port, r, r < 0 ? " " : "", r < 0 ? strerror(e) : "");
+    }
+    errno = e;
+    return r;
+}
+
+int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res)
+{
+    static int (*rg)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
+    if (!rg) rg = dlsym(RTLD_NEXT, "getaddrinfo");
+    int r = rg(node, service, hints, res);
+    init_log();
+    if (logging >= 3) {
+        char h[64] = "-"; int port;
+        if (r == 0 && res && *res) net_addr((*res)->ai_addr, h, sizeof(h), &port);
+        LOG("net: getaddrinfo %s %s -> %d %s %s", node ? node : "(null)", service ? service : "", r, r ? gai_strerror(r) : "", h);
+    }
+    return r;
+}
+
+struct hostent *gethostbyname(const char *name)
+{
+    static struct hostent *(*rh)(const char *);
+    if (!rh) rh = dlsym(RTLD_NEXT, "gethostbyname");
+    struct hostent *h = rh(name);
+    init_log();
+    if (logging >= 3) {
+        char a[64] = "-";
+        if (h && h->h_addr_list && h->h_addr_list[0]) inet_ntop(h->h_addrtype, h->h_addr_list[0], a, sizeof(a));
+        LOG("net: gethostbyname %s -> %s", name ? name : "(null)", a);
+    }
+    return h;
+}
+
+ssize_t send(int fd, const void *b, size_t n, int flags)
+{
+    static ssize_t (*rs)(int, const void *, size_t, int);
+    if (!rs) rs = dlsym(RTLD_NEXT, "send");
+    ssize_t r = rs(fd, b, n, flags); int e = errno;
+    init_log();
+    if (logging >= 3) {
+        char t[49]; size_t k = n < 48 ? n : 48;
+        for (size_t i = 0; i < k; ++i) { char c = ((const char *)b)[i]; t[i] = (c >= 32 && c < 127) ? c : '.'; }
+        t[k] = 0;
+        LOG("net: send fd %d %zu -> %zd \"%s\"", fd, n, r, t);
+    }
+    errno = e;
+    return r;
+}
+
+ssize_t recv(int fd, void *b, size_t n, int flags)
+{
+    static ssize_t (*rr)(int, void *, size_t, int);
+    if (!rr) rr = dlsym(RTLD_NEXT, "recv");
+    ssize_t r = rr(fd, b, n, flags); int e = errno;
+    init_log();
+    if (logging >= 3 && r != 0) {
+        char t[49]; size_t k = r > 0 ? ((size_t)r < 48 ? (size_t)r : 48) : 0;
+        for (size_t i = 0; i < k; ++i) { char c = ((const char *)b)[i]; t[i] = (c >= 32 && c < 127) ? c : '.'; }
+        t[k] = 0;
+        LOG("net: recv fd %d %zu -> %zd%s%s \"%s\"", fd, n, r, r < 0 ? " " : "", r < 0 ? strerror(e) : "", t);
+    }
+    errno = e;
+    return r;
+}
+
+/* level 3: children of makemkvcon carry the shim too (their network use is logged), and what is started is logged */
+__attribute__((constructor)) static void mmshim_children(void)
+{
+    init_log();
+    if (logging >= 3 && !getenv("LD_PRELOAD")) setenv("LD_PRELOAD", "/usr/lib/libmmshim.so", 1);
+    if (logging >= 3) { char exe[256] = ""; ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1); if (n > 0) exe[n] = 0; LOG("process %d (parent %d) %s", (int)getpid(), (int)getppid(), exe); }
+}
+
+int execve(const char *path, char *const argv[], char *const envp[])
+{
+    static int (*re)(const char *, char *const[], char *const[]);
+    if (!re) re = dlsym(RTLD_NEXT, "execve");
+    init_log();
+    if (logging >= 3) {
+        char a[256] = ""; int n = 0;
+        for (int i = 0; argv && argv[i] && n < 200; ++i) n += snprintf(a + n, sizeof(a) - n, "%s ", argv[i]);
+        LOG("execve %s [%s]", path ? path : "(null)", a);
+    }
+    return re(path, argv, envp);
+}

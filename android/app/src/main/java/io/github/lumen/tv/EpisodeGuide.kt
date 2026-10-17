@@ -20,9 +20,20 @@ object EpisodeGuide {
     class Result(val show: String, val premiered: String, val episodes: List<Episode>, val firstGuessed: Boolean,
                  val start: Int = 0, val base: Int = 0, val slots: Int = 1, val image: String = "")
 
+    fun toJson(r: Result): String = JSONObject().put("show", r.show).put("premiered", r.premiered).put("guessed", r.firstGuessed)
+        .put("start", r.start).put("base", r.base).put("slots", r.slots).put("image", r.image)
+        .put("episodes", JSONArray(r.episodes.map { JSONObject().put("s", it.season).put("n", it.number).put("name", it.name).put("min", it.minutes) })).toString()
+
+    fun fromJson(s: String?): Result? = try {
+        val o = JSONObject(s ?: return null)
+        val a = o.getJSONArray("episodes")
+        Result(o.getString("show"), o.optString("premiered"), (0 until a.length()).map { a.getJSONObject(it) }.map { Episode(it.getInt("s"), it.getInt("n"), it.optString("name"), it.optInt("min")) },
+            o.optBoolean("guessed"), o.optInt("start"), o.optInt("base"), o.optInt("slots", 1), o.optString("image"))
+    } catch (_: Exception) { null }
+
     private fun get(url: String): String {
         val c = URL(url).openConnection() as HttpURLConnection
-        c.connectTimeout = 10000; c.readTimeout = 15000
+        c.connectTimeout = 10000; c.readTimeout = 25000
         c.setRequestProperty("User-Agent", "LumenTV")
         return c.inputStream.bufferedReader().use { it.readText() }
     }
@@ -35,7 +46,9 @@ object EpisodeGuide {
             var best: Pair<Double, Result>? = null
             for (i in 0 until minOf(found.length(), 5)) {
                 val show = found.getJSONObject(i).getJSONObject("show")
-                val eps = JSONArray(get("https://api.tvmaze.com/shows/${show.getInt("id")}/episodes"))
+                // (one show that does not answer in time – a long one, like the Doctor Who of 1963 – is left out, not the whole look-up)
+                val eps = try { JSONArray(get("https://api.tvmaze.com/shows/${show.getInt("id")}/episodes")) }
+                    catch (ex: Exception) { log("TVmaze: ${show.optString("name")} (${show.optString("premiered")}): $ex"); continue }
                 val inSeason = (0 until eps.length()).map { eps.getJSONObject(it) }
                     .filter { it.optInt("season") == season && !it.isNull("number") }
                     .map { Episode(season, it.getInt("number"), it.optString("name"), it.optInt("runtime", show.optInt("averageRuntime", 0))) }

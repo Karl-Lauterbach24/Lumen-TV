@@ -35,6 +35,8 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         @Volatile var lastLook = System.currentTimeMillis()
         /** AACS bus encryption: the disc asks for it / the drive can do it (null: not known) */
         var busDisc: Boolean? = null
+        /** An Ultra HD Blu-ray (index.bdmv of version 0300): AACS 2, the drive encrypts what it reads unless LibreDrive is on. */
+        var uhd = false
         var busDrive: Boolean? = null
         /** the drive's read data key (bus decryption) and what happened when it was asked for */
         @Volatile var busKey: ByteArray? = null
@@ -89,7 +91,15 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     /** A protected Blu-ray this app cannot decrypt itself (its key is not in the key database). */
     fun label(key: String): String = synchronized(open) { open[key] }?.label.orEmpty()
 
-    fun needsMakeMkv(key: String): Boolean = synchronized(open) { open[key] }?.let { it.kind == "Blu-ray" && it.encrypted && it.keys == null } ?: false
+    /**
+     * A disc that asks for bus encryption in a drive that does it, with no session key and no LibreDrive: its streams must not be read
+     * by the app (the drive sends them encrypted for the bus, or stops answering altogether).
+     */
+    private fun busBlocked(d: Disc): Boolean = d.encrypted && d.busDisc == true && d.busDrive != false && d.busKey == null && d.key !in libreReady
+
+    fun needsMakeMkv(key: String): Boolean = synchronized(open) { open[key] }?.let {
+        it.kind == "Blu-ray" && it.encrypted && (it.keys == null || (!it.uhd && busBlocked(it)))
+    } ?: false
 
     fun lend(key: String): UsbDevice? {
         synchronized(lent) { lent.add(key) }
@@ -107,8 +117,21 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     }
 
     /** A file of the disc as plain bytes: the streams of an AACS disc are decrypted as they are read. */
+    /** Drives in which MakeMKV has switched LibreDrive on (until the drive is plugged in again: then its key changes). */
+    val libreReady: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
+
+    /**
+     * A 4K disc whose keys the key database has, in a drive LibreDrive is not on in yet: its streams are not read before that (the drive
+     * would send them bus-encrypted, or stop answering), see MainActivity.mkLibre.
+     */
+    fun needsLibreDrive(key: String): Boolean = synchronized(open) { open[key] }?.let { it.uhd && it.encrypted && it.keys != null && key !in libreReady } ?: false
+
+    fun isUhd(key: String): Boolean = synchronized(open) { open[key] }?.uhd ?: false
+
     fun reader(key: String, path: String): RandomReader? {
+        if (needsLibreDrive(key)) return null
         val d = synchronized(open) { open[key] } ?: return null
+        if (d.encrypted) { ensureBus(d); if (busBlocked(d) && path.startsWith("BDMV/STREAM/", true)) return null }
         val r = d.udf?.open(path) ?: return null
         val keys = d.keys
         if (d.encrypted && keys != null && path.startsWith("BDMV/STREAM/", true)) { ensureBus(d); return AacsReader(r, keys.keys, d.busKey) }
@@ -118,11 +141,16 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     /** A disc that asks for bus encryption on a drive that does it: authenticate to the drive once (needs a host certificate). */
     @Synchronized private fun ensureBus(d: Disc) {
         if (d.busKey != null || d.busStatus != null) return
+        // with LibreDrive on, the drive does not encrypt: no authentication (it would be refused, and a refused one has stopped drives)
+        if (d.key in libreReady) { d.busStatus = "not needed (LibreDrive)"; return }
         if (d.busDisc != true || d.busDrive == false) return
         val usbSrc = d.source as? UsbBlockSource ?: return
         // the user's own certificates first (hostcerts.cfg in the app's folder is never overwritten by an update of the database)
         val own = listOfNotNull(File(activity.filesDir, "hostcerts.cfg"), activity.getExternalFilesDir(null)?.let { File(it, "hostcerts.cfg") })
-        val certs = AacsDrive.hostCerts(own + keyFiles())
+        // only with a certificate of the user's own: the ones in the public key database are revoked in current drives, and a drive that
+        // refused one has been seen to stop answering when it was read afterwards (the disc then goes to MakeMKV instead)
+        if (own.none { it.isFile }) { d.busStatus = "no host certificate of your own (hostcerts.cfg)"; return }
+        val certs = AacsDrive.hostCerts(own)
         val r = AacsDrive.readDataKey(usbSrc, certs) { android.util.Log.i("LumenTV", "AACS: $it") }
         d.busKey = r.readDataKey
         d.busStatus = r.message
@@ -131,10 +159,11 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
 
     /** The disc's files for libbluray (menus), with the AACS keys if they are known. */
     fun fs(key: String): DiscFs? {
+        if (needsLibreDrive(key)) return null
         val d = synchronized(open) { open[key] } ?: return null
         val udf = d.udf ?: return null
         if (d.encrypted && d.keys == null) return null
-        if (d.encrypted) ensureBus(d)
+        if (d.encrypted) { ensureBus(d); if (busBlocked(d)) return null }
         return DiscFs(udf, if (d.encrypted) d.keys?.keys else null, d.busKey)
     }
 
@@ -357,6 +386,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         val d = Disc(key, label, kind, udf, src, encrypted, "")
         d.bdplus = udf.exists("BDSVM") || udf.exists("BDMV/BDSVM") || udf.exists("BDMV/STREAM/SSIF/BDSVM") ||
             try { udf.list("BDSVM").isNotEmpty() } catch (_: Exception) { false }
+        d.uhd = bd && try { val r = udf.open("BDMV/index.bdmv"); val b = ByteArray(8); r.read(0, b, 0, 8); String(b, Charsets.ISO_8859_1) == "INDX0300" } catch (_: Exception) { false }
         if (encrypted) {
             d.discId = try { Aacs.discId(udf) } catch (_: Exception) { null }
             d.busDisc = try {
@@ -397,7 +427,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         extra.forEach { out.put(it) }
         // the disc's own entries while MakeMKV handles the disc: only the ones that do not say "cannot" (the rest under "more")
         val d = synchronized(open) { open[key] }
-        if (d != null && d.encrypted && d.keys == null)
+        if (d != null && d.encrypted && (d.keys == null || needsMakeMkv(key) || needsLibreDrive(key)))
             out.put(JSONObject().put("name", t("Weitere Optionen", "More options")).put("detail", t("Schlüsseldatenbank, Diagnose", "key database, diagnostics"))
                 .put("path", "disc:$key|#more/").put("dir", true).put("icon", "tune"))
         else for (i in 0 until own.length()) out.put(own.get(i))
@@ -416,6 +446,11 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             out.put(JSONObject().put("name", if (have) t("Schlüsseldatenbank aus dem Netz erneuern", "Update the key database from the net") else t("Schlüsseldatenbank aus dem Netz laden", "Load the key database from the net"))
                 .put("path", "disc:$key|#keys").put("dir", false).put("action", "keys").put("icon", "key"))
             out.put(JSONObject().put("name", t("Warum? (Disc-ID und Schlüsseldatenbank)", "Why? (disc ID and key database)")).put("path", "disc:$key|#info").put("dir", false).put("action", "info").put("icon", "info"))
+            return out
+        }
+        // keys known, but the drive would send the streams encrypted for the bus: MakeMKV plays it (or LibreDrive is switched on first)
+        if (d.encrypted && rel.isEmpty() && (needsMakeMkv(key) || needsLibreDrive(key))) {
+            out.put(JSONObject().put("name", t("Schutz dieser Disc (AACS)", "Protection of this disc (AACS)")).put("path", "disc:$key|#info").put("dir", false).put("action", "info").put("icon", "info"))
             return out
         }
         if (rel.isEmpty() && d.kind == "Blu-ray") {
