@@ -183,6 +183,7 @@ static void event_name(const BD_EVENT *ev)
     case BD_EVENT_PG_TEXTST_STREAM: n = "pg_stream"; break;
     case BD_EVENT_PG_TEXTST: n = "pg_enabled"; break;
     case BD_EVENT_MENU: n = "menu"; break;
+    case BD_EVENT_SOUND_EFFECT: n = "sound"; break;
     case BD_EVENT_IDLE: case BD_EVENT_NONE: return;
     default: break;
     }
@@ -217,10 +218,290 @@ static void command(BLURAY *bd, char *line)
     }
 }
 
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * serve mode:  bdmenu <device> <outdir> serve <ts-fifo> <menu-lang>
+ * The disc plays as a whole: the stream (plain transport packets, time stamps made continuous) goes into the fifo, the menu's
+ * pictures are written per plane (g<seq>_<plane>.raw, "BDIG w h x y" + RGBA) and announced on stdout:
+ *     READY | EVENT <name> <value> | FLUSH <seq> <plane> <x> <y> <w> <h> | CLEAR <plane> | SOUND <id> <channels> <frames> <file>
+ * Commands on stdin: key <BD_VK number> | menu | title <n> | quit.
+ * --------------------------------------------------------------------------------------------------------------- */
+#include <signal.h>
+#include <sys/stat.h>
+
+#define MOD33 ((int64_t)1 << 33)
+static int64_t g_off, g_last_pcr;
+static int g_have_pcr, g_pend;
+static int64_t g_last_pts[2];       /* the last picture / sound time given out */
+
+static int64_t ts_read33(const uint8_t *p)
+{
+    return ((int64_t)(p[0] & 0x0e) << 29) | ((int64_t)p[1] << 22) | ((int64_t)(p[2] & 0xfe) << 14) | ((int64_t)p[3] << 7) | (p[4] >> 1);
+}
+static void ts_write33(uint8_t *p, int64_t v, int prefix)
+{
+    p[0] = (uint8_t)((prefix << 4) | (((v >> 30) & 7) << 1) | 1);
+    p[1] = (uint8_t)(v >> 22);
+    p[2] = (uint8_t)((((v >> 15) & 0x7f) << 1) | 1);
+    p[3] = (uint8_t)(v >> 7);
+    p[4] = (uint8_t)(((v & 0x7f) << 1) | 1);
+}
+
+/* continuous time: the clock of each clip starts anew (a menu loop, the next play item); the player wants one timeline */
+static void retime(uint8_t *buf, int len)
+{
+    for (int o = 0; o + 188 <= len; o += 188) {
+        uint8_t *p = buf + o;
+        if (p[0] != 0x47) continue;
+        int afc = (p[3] >> 4) & 3;
+        int at = 4;
+        if (afc & 2) {
+            int alen = p[4];
+            if (alen >= 7 && (p[5] & 0x10)) {
+                int64_t base = ((int64_t)p[6] << 25) | ((int64_t)p[7] << 17) | ((int64_t)p[8] << 9) | ((int64_t)p[9] << 1) | (p[10] >> 7);
+                int64_t adj = (base + g_off) % MOD33;
+                if (g_have_pcr) {
+                    int64_t d = adj - g_last_pcr;
+                    if (d > MOD33 / 2) d -= MOD33;
+                    if (d < -MOD33 / 2) d += MOD33;
+                    if (d < -45000 || d > 270000) {
+                        g_off = ((g_last_pcr + 1800 - base) % MOD33 + MOD33) % MOD33;
+                        adj = (base + g_off) % MOD33;
+                        g_pend = 1;         /* the first picture/sound time of the new clip sets the offset exactly (below) */
+                    }
+                }
+                g_last_pcr = adj; g_have_pcr = 1;
+                p[6] = (uint8_t)(adj >> 25); p[7] = (uint8_t)(adj >> 17); p[8] = (uint8_t)(adj >> 9); p[9] = (uint8_t)(adj >> 1);
+                p[10] = (uint8_t)((p[10] & 0x7f) | ((adj & 1) << 7));
+            }
+            at = 5 + alen;
+        }
+        if ((p[1] & 0x40) && (afc & 1) && at + 14 <= 188 && p[at] == 0 && p[at + 1] == 0 && p[at + 2] == 1) {
+            int flags = p[at + 7] >> 6;
+            if (flags >= 2) {
+                int sid = p[at + 3], cls = (sid >= 0xe0 && sid <= 0xef) ? 0 : 1;
+                int64_t raw = ts_read33(p + at + 9);
+                if (g_pend && g_last_pts[cls] > 0) {
+                    /* the clip's pictures start further ahead of its clock than the last clip's ended: without this the player sees a hole of half a second in sound and picture (and its audio sink stops on it) */
+                    int64_t target = g_last_pts[cls] + (cls ? 1000 : 3750);
+                    g_off = ((target - raw) % MOD33 + MOD33) % MOD33;
+                    g_pend = 0;
+                }
+                int64_t pts = (raw + g_off) % MOD33;
+                g_last_pts[cls] = pts;
+                ts_write33(p + at + 9, pts, flags == 3 ? 3 : 2);
+                if (flags == 3 && at + 19 <= 188) {
+                    int64_t dts = (ts_read33(p + at + 14) + g_off) % MOD33;
+                    ts_write33(p + at + 14, dts, 1);
+                }
+            }
+        }
+    }
+}
+
+/*
+ * The player's transport stream reader knows the stream types of broadcast TV, not all those of a Blu-ray: DTS-HD (0x85, 0x86,
+ * 0xa2) is passed as DTS (0x82: the core inside it is what plays), secondary Dolby Digital Plus (0xa1) and 0x84 as 0x87. The
+ * PMT is changed in the stream and its CRC made again.
+ */
+static uint32_t crc32_mpeg(const uint8_t *d, int n)
+{
+    uint32_t c = 0xffffffffu;
+    for (int i = 0; i < n; ++i) {
+        c ^= (uint32_t)d[i] << 24;
+        for (int k = 0; k < 8; ++k) c = (c & 0x80000000u) ? (c << 1) ^ 0x04c11db7u : (c << 1);
+    }
+    return c;
+}
+static int g_pmt_pid = -1, g_pmt_dn = -1;
+static char g_pmt_desc[160];
+static void fix_pmt(uint8_t *buf, int len)
+{
+    for (int o = 0; o + 188 <= len; o += 188) {
+        uint8_t *p = buf + o;
+        if (p[0] != 0x47) continue;
+        int pid = ((p[1] & 0x1f) << 8) | p[2];
+        int pusi = p[1] & 0x40;
+        if (pid == 0 && pusi && (p[3] & 0x10)) {
+            uint8_t *s = p + 5 + p[4];
+            int sl = ((s[1] & 0xf) << 8) | s[2];
+            if (s[0] == 0) for (int j = 8; j + 4 <= 3 + sl - 4 && j + 4 < 180; j += 4) if (((s[j] << 8) | s[j + 1]) != 0) { g_pmt_pid = ((s[j + 2] & 0x1f) << 8) | s[j + 3]; break; }
+        } else if (pid == g_pmt_pid && pusi && (p[3] & 0x10)) {
+            uint8_t *s = p + 5 + p[4];
+            if (s[0] != 2) continue;
+            int sl = ((s[1] & 0xf) << 8) | s[2];
+            if (5 + p[4] + 3 + sl > 188) continue;                      /* (a section over several packets is left alone) */
+            int pil = ((s[10] & 0xf) << 8) | s[11];
+            int i = 12 + pil, end = 3 + sl - 4, changed = 0;
+            char desc[160]; int dn = 0;
+            for (int j = i; j + 5 <= end && dn < 140; j += 5 + (((s[j + 3] & 0xf) << 8) | s[j + 4]))
+                dn += snprintf(desc + dn, sizeof(desc) - (size_t)dn, " %02x:%04x", s[j], ((s[j + 1] & 0x1f) << 8) | s[j + 2]);
+            if (dn != g_pmt_dn || memcmp(desc, g_pmt_desc, (size_t)dn)) { memcpy(g_pmt_desc, desc, (size_t)dn); g_pmt_dn = dn; fprintf(stderr, "PMT%.*s\n", dn, desc); }
+            while (i + 5 <= end) {
+                int st = s[i], l = ((s[i + 3] & 0xf) << 8) | s[i + 4];
+                int to = st;
+                if (st == 0x85 || st == 0x86 || st == 0xa2) to = 0x82;
+                else if (st == 0x84 || st == 0xa1) to = 0x87;
+                if (to != st) { s[i] = (uint8_t)to; changed = 1; }
+                i += 5 + l;
+            }
+            if (changed) {
+                uint32_t c = crc32_mpeg(s, 3 + sl - 4);
+                s[end] = (uint8_t)(c >> 24); s[end + 1] = (uint8_t)(c >> 16); s[end + 2] = (uint8_t)(c >> 8); s[end + 3] = (uint8_t)c;
+            }
+        }
+    }
+}
+
+static int sv_dirty[2], sv_x0[2], sv_y0[2], sv_x1[2], sv_y1[2];
+
+static void sv_mark(int pl, int x, int y, int w, int h)
+{
+    if (!sv_dirty[pl]) { sv_x0[pl] = x; sv_y0[pl] = y; sv_x1[pl] = x + w; sv_y1[pl] = y + h; sv_dirty[pl] = 1; return; }
+    if (x < sv_x0[pl]) sv_x0[pl] = x;
+    if (y < sv_y0[pl]) sv_y0[pl] = y;
+    if (x + w > sv_x1[pl]) sv_x1[pl] = x + w;
+    if (y + h > sv_y1[pl]) sv_y1[pl] = y + h;
+}
+
+static void sv_overlay(void *handle, const BD_OVERLAY *ov)
+{
+    (void)handle;
+    if (!ov) return;
+    int pl = ov->plane > 1 ? 1 : ov->plane;
+    switch (ov->cmd) {
+    case BD_OVERLAY_INIT:
+        break;
+    case BD_OVERLAY_CLOSE: case BD_OVERLAY_CLEAR: case BD_OVERLAY_HIDE:
+        memset(plane[pl], 0, (size_t)W * H * 4);
+        sv_dirty[pl] = 0;
+        printf("CLEAR %d\n", pl); fflush(stdout);
+        break;
+    case BD_OVERLAY_WIPE:
+        for (int j = ov->y; j < ov->y + ov->h && j < H; ++j) memset(plane[pl] + j * W + ov->x, 0, (size_t)(ov->w) * 4);
+        sv_mark(pl, ov->x, ov->y, ov->w, ov->h);
+        break;
+    case BD_OVERLAY_DRAW:
+        if (!ov->img || !ov->palette || ov->palette_update_flag) break;
+        {
+            uint32_t pal[256];
+            for (int i = 0; i < 256; ++i) pal[i] = rgba(&ov->palette[i]);
+            int n = 0, total = ov->w * ov->h;
+            const BD_PG_RLE_ELEM *e = ov->img;
+            while (n < total) {
+                int len = e->len, col = e->color;
+                if (len == 0 && col == 0) { e++; continue; }
+                while (len-- > 0 && n < total) {
+                    int px = ov->x + n % ov->w, py = ov->y + n / ov->w;
+                    if (px < W && py < H) plane[pl][py * W + px] = pal[col & 255];
+                    n++;
+                }
+                e++;
+            }
+            sv_mark(pl, ov->x, ov->y, ov->w, ov->h);
+        }
+        break;
+    case BD_OVERLAY_FLUSH:
+        for (int q = 0; q < 2; ++q) {
+            if (!sv_dirty[q]) continue;
+            int x0 = sv_x0[q] < 0 ? 0 : sv_x0[q], y0 = sv_y0[q] < 0 ? 0 : sv_y0[q], x1 = sv_x1[q] > W ? W : sv_x1[q], y1 = sv_y1[q] > H ? H : sv_y1[q];
+            sv_dirty[q] = 0;
+            if (x1 <= x0 || y1 <= y0) continue;
+            char path[512];
+            snprintf(path, sizeof(path), "%s/g%04d_%d.raw", outdir, ++seq, q);
+            FILE *f = fopen(path, "wb");
+            if (!f) continue;
+            fprintf(f, "BDIG %d %d %d %d\n", x1 - x0, y1 - y0, x0, y0);
+            for (int j = y0; j < y1; ++j) fwrite(plane[q] + j * W + x0, 4, (size_t)(x1 - x0), f);
+            fclose(f);
+            printf("FLUSH %d %d %d %d %d %d\n", seq, q, x0, y0, x1 - x0, y1 - y0);
+            fflush(stdout);
+        }
+        break;
+    }
+}
+
+static int serve(const char *device, const char *fifo, const char *lang)
+{
+    signal(SIGPIPE, SIG_IGN);
+    if (getenv("BDM_PRELOAD")) setenv("LD_PRELOAD", getenv("BDM_PRELOAD"), 1);
+    plane[0] = calloc((size_t)W * H, 4);
+    plane[1] = calloc((size_t)W * H, 4);
+    BLURAY *bd = bd_open(device, NULL);
+    if (!bd) { printf("ERROR open\n"); return 1; }
+    const BLURAY_DISC_INFO *di = bd_get_disc_info(bd);
+    if (di) printf("DISC aacs_handled=%d hdmv=%d bdj=%d\n", di->aacs_handled, di->num_hdmv_titles, di->bdj_detected);
+    bd_set_player_setting_str(bd, BLURAY_PLAYER_SETTING_MENU_LANG, lang);
+    bd_set_player_setting_str(bd, BLURAY_PLAYER_SETTING_AUDIO_LANG, lang);
+    bd_set_player_setting_str(bd, BLURAY_PLAYER_SETTING_PG_LANG, lang);
+    bd_set_player_setting_str(bd, BLURAY_PLAYER_SETTING_COUNTRY_CODE, "DE");
+    bd_set_player_setting(bd, BLURAY_PLAYER_SETTING_REGION_CODE, 2);
+    bd_set_player_setting(bd, BLURAY_PLAYER_SETTING_DECODE_PG, 1);
+    bd_register_overlay_proc(bd, NULL, sv_overlay);
+    if (!bd_play(bd)) { printf("ERROR play\n"); return 1; }
+    printf("READY\n"); fflush(stdout);
+    /* the stream goes into the fifo once the player has opened its end */
+    int fd = -1;
+    while (fd < 0) {
+        fd = open(fifo, O_WRONLY | O_NONBLOCK);
+        if (fd < 0) { usleep(100000); fd_set fs; struct timeval tv = { 0, 0 }; FD_ZERO(&fs); FD_SET(0, &fs); if (select(1, &fs, NULL, NULL, &tv) > 0) { char l[64]; if (!fgets(l, sizeof(l), stdin) || !strncmp(l, "quit", 4)) { bd_close(bd); return 0; } } }
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+    static unsigned char tmp[6144 * 8], out[188 * 32 * 8];
+    for (;;) {
+        BD_EVENT ev;
+        ev.event = BD_EVENT_NONE;
+        int n = bd_read_ext(bd, tmp, sizeof(tmp), &ev);
+        if (ev.event != BD_EVENT_NONE) {
+            event_name(&ev);
+            if (ev.event == BD_EVENT_SOUND_EFFECT) {
+                BLURAY_SOUND_EFFECT fx;
+                if (bd_get_sound_effect(bd, ev.param, &fx) > 0 && fx.samples && fx.num_frames) {
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s/snd%u.pcm", outdir, ev.param);
+                    FILE *f = fopen(path, "wb");
+                    if (f) { fwrite(fx.samples, 2, (size_t)fx.num_frames * fx.num_channels, f); fclose(f); printf("SOUND %u %d %u %s\n", ev.param, fx.num_channels, fx.num_frames, path); fflush(stdout); }
+                }
+            }
+        }
+        while (bd_get_event(bd, &ev) && ev.event != BD_EVENT_NONE) event_name(&ev);
+        if (n < 0) break;
+        if (n > 0) {
+            int w = 0;
+            for (int o = 0; o + 192 <= n && w + 188 <= (int)sizeof(out); o += 192) { memcpy(out + w, tmp + o + 4, 188); w += 188; }
+            retime(out, w);
+            fix_pmt(out, w);
+            int done = 0;
+            while (done < w) {
+                ssize_t r = write(fd, out + done, (size_t)(w - done));
+                if (r < 0) { if (errno == EINTR) continue; goto end; }      /* the player is gone */
+                done += (int)r;
+            }
+        } else usleep(15000);
+        fd_set fs;
+        struct timeval tv = { 0, 0 };
+        FD_ZERO(&fs); FD_SET(0, &fs);
+        while (select(1, &fs, NULL, NULL, &tv) > 0) {
+            char line[128]; int a = 0;
+            if (!fgets(line, sizeof(line), stdin)) goto end;
+            if (sscanf(line, "key %d", &a) == 1) { bd_user_input(bd, -1, (uint32_t)a); }
+            else if (!strncmp(line, "menu", 4)) bd_menu_call(bd, -1);
+            else if (sscanf(line, "title %d", &a) == 1) bd_play_title(bd, (unsigned)a);
+            else if (!strncmp(line, "quit", 4)) goto end;
+            FD_ZERO(&fs); FD_SET(0, &fs);
+        }
+    }
+end:
+    close(fd);
+    bd_close(bd);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) { fprintf(stderr, "usage: bdmenu <device> <outdir>\n"); return 2; }
     outdir = argv[2];
+    if (argc >= 6 && !strcmp(argv[3], "serve")) return serve(argv[1], argv[4], argv[5]);
     /* libmmbd starts MakeMKV's helper (makemkvcon) itself: it must find the drive shim, too (set here: for the loader of the host the variable would be wrong) */
     if (getenv("BDM_PRELOAD")) setenv("LD_PRELOAD", getenv("BDM_PRELOAD"), 1);
     setvbuf(stdout, NULL, _IOLBF, 0);

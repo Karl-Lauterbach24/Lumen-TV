@@ -631,9 +631,9 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     } catch (_: Exception) { -1 }
 
     /** bdmenu (see makemkv-native/bdmenu): plays the disc's menu through libbluray and libmmbd; its stdout is the menu's events. */
-    fun startMenu(): Process {
-        File(root, "tmp/menu").apply { listFiles()?.forEach { it.delete() }; mkdirs() }
-        val p = command(listOf("/dev/sg0", "/tmp/menu"), mapOf("LIBAACS_PATH" to "libmmbd", "LIBBDPLUS_PATH" to "libmmbd", "MAKEMKVCON" to "/usr/bin/makemkvcon", "BDM_PRELOAD" to "/usr/lib/libmmshim.so", "MMBD_TRACE" to "1"), "/usr/bin/bdmenu").start()
+    fun startMenu(more: List<String> = emptyList()): Process {
+        File(root, "tmp/menu").apply { if (more.isEmpty()) listFiles()?.forEach { it.delete() }; mkdirs() }
+        val p = command(listOf("/dev/sg0", "/tmp/menu") + more, mapOf("LIBAACS_PATH" to "libmmbd", "LIBBDPLUS_PATH" to "libmmbd", "MAKEMKVCON" to "/usr/bin/makemkvcon", "BDM_PRELOAD" to "/usr/lib/libmmshim.so", "MMBD_TRACE" to "1"), "/usr/bin/bdmenu").start()
         proc = p
         return p
     }

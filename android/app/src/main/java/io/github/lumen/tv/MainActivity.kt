@@ -48,6 +48,7 @@ class MainActivity : Activity() {
     private var bd: Bd? = null
     private var bdFs: DiscFs? = null
     private var bdKey = ""
+    private var remoteBd: RemoteBd? = null
     private lateinit var bdOverlay: android.view.View
     private lateinit var bdPg: android.widget.ImageView
     private lateinit var bdIg: android.widget.ImageView
@@ -135,9 +136,20 @@ class MainActivity : Activity() {
         val load = androidx.media3.exoplayer.DefaultLoadControl.Builder()
             .apply {
                 if (long) setBufferDurationsMs(6000, 15000, 2500, 4000).setTargetBufferBytes(12 shl 20).setPrioritizeTimeOverSizeThresholds(false)
-                else setBufferDurationsMs(2000, 4000, 800, 1500)
+                else setBufferDurationsMs(2000, 4000, 800, 1500).setPrioritizeTimeOverSizeThresholds(true)   // (a disc stream runs seconds ahead in the picture: size must not stop the loading while the sound is still missing)
             }.build()
         val p = ExoPlayer.Builder(this, factory).setLoadControl(load).build()
+        p.addAnalyticsListener(object : androidx.media3.exoplayer.analytics.AnalyticsListener {
+            override fun onAudioInputFormatChanged(e: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, f: androidx.media3.common.Format, r: androidx.media3.exoplayer.DecoderReuseEvaluation?) { mkLog("audio: input format ${f.sampleMimeType} ${f.channelCount}ch ${f.sampleRate} Hz ${f.codecs}") }
+            override fun onAudioDecoderInitialized(e: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, n: String, t: Long, d: Long) { mkLog("audio: decoder $n") }
+            override fun onDownstreamFormatChanged(e: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, d: androidx.media3.exoplayer.source.MediaLoadData) { d.trackFormat?.let { mkLog("downstream: ${it.sampleMimeType} ${it.channelCount}ch ${it.sampleRate} Hz ${it.width}x${it.height}") } }
+            override fun onAudioSinkError(e: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, x: Exception) { mkLog("audio: sink error $x") }
+            override fun onAudioCodecError(e: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, x: Exception) { mkLog("audio: codec error $x") }
+            override fun onAudioDecoderReleased(e: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, n: String) { mkLog("audio: decoder released") }
+            override fun onAudioUnderrun(e: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, b: Int, ms: Long, el: Long) { mkLog("audio: underrun") }
+            override fun onAudioPositionAdvancing(e: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, ms: Long) { mkLog("audio: position advancing") }
+            override fun onPositionDiscontinuity(e: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime, o: Player.PositionInfo, n: Player.PositionInfo, reason: Int) { mkLog("player: discontinuity reason $reason") }
+        })
         p.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 if (mkKey != null) mkLog("player: state ${when (state) { Player.STATE_BUFFERING -> "buffering"; Player.STATE_READY -> "ready"; Player.STATE_ENDED -> "ended"; else -> "idle" }} at ${p.currentPosition / 1000} s, buffered to ${p.bufferedPosition / 1000} s")
@@ -203,12 +215,21 @@ class MainActivity : Activity() {
     }
 
     /** Tells the page what the player does; the page keeps its own video element in step with it. */
+    private var stallPos = -1L
+    private var stallSince = 0L
     private fun event(name: String) {
         val p = player ?: return
         val dur = if (p.duration > 0) p.duration else 0
+        if (name == "timeupdate") {      // (diagnostics: the threads of the player when the picture stands still)
+            if (p.currentPosition != stallPos) { stallPos = p.currentPosition; stallSince = System.currentTimeMillis() }
+            else if (p.isPlaying && System.currentTimeMillis() - stallSince in 6000..6600) {
+                for ((t, st) in Thread.getAllStackTraces()) if (t.name.startsWith("ExoPlayer") || t.name.startsWith("Loader"))
+                    android.util.Log.i("LumenTV", "stall: ${t.name} ${t.state}: " + st.take(9).joinToString(" < ") { "${it.className.substringAfterLast('.')}.${it.methodName}" })
+            }
+        }
         if (name == "timeupdate" && p.currentPosition / 5000 != lastLogged) {
             lastLogged = p.currentPosition / 5000
-            android.util.Log.i("LumenTV", "position ${p.currentPosition} duration ${p.duration} seekable ${p.isCurrentMediaItemSeekable}")
+            android.util.Log.i("LumenTV", "position ${p.currentPosition} duration ${p.duration} seekable ${p.isCurrentMediaItemSeekable} state ${p.playbackState} playing ${p.isPlaying} buffered ${p.bufferedPosition} fifo ${FifoDataSource.total / 1000000.0} MB")
         }
         js("window.__lumenEvent&&window.__lumenEvent('$name',${p.currentPosition},$dur,${if (p.isPlaying || (p.playWhenReady && p.playbackState == Player.STATE_BUFFERING)) "false" else "true"})")
     }
@@ -281,9 +302,20 @@ class MainActivity : Activity() {
             val factory = BdDataSource.Factory(b) { type, value -> bdEvent(type, value) }
             val extractors = androidx.media3.extractor.DefaultExtractorsFactory()
                 .setTsExtractorFlags(androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
-                    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS)
+                    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS or
+                    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
                 .setConstantBitrateSeekingEnabled(false)
             val source = androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(factory, extractors)
+                .createMediaSource(MediaItem.fromUri(uri))
+            p.setMediaSource(source)
+        } else if (uri.scheme == "makemenu") {
+            val rb = remoteBd ?: return
+            val extractors = androidx.media3.extractor.DefaultExtractorsFactory()
+                .setTsExtractorFlags(androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
+                    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS or
+                    androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
+                .setConstantBitrateSeekingEnabled(false)
+            val source = androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(FifoDataSource.Factory(rb.fifo), extractors)
                 .createMediaSource(MediaItem.fromUri(uri))
             p.setMediaSource(source)
         } else if (uri.scheme == "disc") {
@@ -385,6 +417,7 @@ class MainActivity : Activity() {
 
     private fun closePlayer() {
         closeBd()
+        remoteBd?.let { rb -> remoteBd = null; bdOverlay.visibility = View.GONE; bdBitmaps.fill(null); kotlin.concurrent.thread { rb.close() } }
         stopMakeMkv()
         main.removeCallbacks(tick)
         player?.let { it.stop(); it.clearMediaItems() }
@@ -632,6 +665,9 @@ class MainActivity : Activity() {
             .put("icon", if (d.kind == "episodes") "episodes" else "film").put("path", "").put("dir", false).put("off", true))
         // the episodes follow one another (the page goes on to the next when one ends); the rest stands alone
         group = "episodes"
+        // the disc's own menu (background picture and sound, its buttons): the disc plays as a whole
+        out.add(JSONObject().put("name", t("Disc mit ihrem Menü abspielen", "Play the disc with its menu")).put("detail", t("Hauptmenü der Disc", "the disc's main menu")).put("icon", "disc")
+            .put("path", "disc:$key|#mkdisc").put("dir", false).put("uri", "makemenu://$key/").put("video", true).put("group", "menu"))
         if (d.kind == "episodes") d.main.forEachIndexed { i, tt ->
             val e = guide?.episodes?.getOrNull(i)
             play(tt, if (e != null) t("Folge ${e.number} · ${e.name}", "Episode ${e.number} · ${e.name}") else "Episode ${i + 1}", "film")
@@ -955,6 +991,61 @@ class MainActivity : Activity() {
         if (type == "audio") makemkv.audioLang = next else makemkv.subLang = next
     }
 
+    /** The disc's own menu through bdmenu (libbluray, libmmbd): the disc plays as a whole, menus and film. Runs on a worker thread. */
+    private fun startMakeMenu(uri: Uri) {
+        val key = uri.host ?: return
+        if (mkMenuState.isNotEmpty()) {
+            mkWantsDrive = true; makemkv.stop()
+            for (i in 0 until 40) { if (mkMenuState.isEmpty()) break; Thread.sleep(500) }
+            mkWantsDrive = false
+        }
+        val closed = java.util.concurrent.CountDownLatch(1)
+        main.post { closePlayer(); closed.countDown() }
+        closed.await()
+        mkLabel(key)
+        mkLog("---- play the disc's menu $uri")
+        if (makemkv.keyMode.isEmpty()) say(t("MakeMKV hat noch keinen Schlüssel (siehe Einstellungen).", "MakeMKV has no key yet (see the settings)."), 8000)
+        val device = discs.lend(key)
+        if (device == null) { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); discs.giveBack(key); return }
+        mkKey = key
+        try {
+            say(t("Das Menü der Disc wird geöffnet (etwa eine Minute) …", "Opening the disc's menu (about a minute) …"), 90000)
+            if (!makemkv.openBridge(device) || !(makemkv.identify() || (makemkv.ejectAndReload() && makemkv.identify()))) {
+                say(t("Das Laufwerk antwortet nicht. Bitte aus- und wieder einschalten.", "The drive does not answer. Switch it off and on again.")); stopMakeMkv(); return
+            }
+            val rb = RemoteBd(makemkv) { mkLog(it) }
+            rb.overlay = { plane, x, y, w, h, px -> bdDraw(plane, x, y, w, h, px) }
+            rb.onSound = { samples, ch -> playPcm(samples, ch) }
+            if (!rb.start(if (java.util.Locale.getDefault().language == "de") "ger" else "eng") { mkKey != key }) {
+                say(t("Das Menü der Disc ließ sich nicht öffnen (siehe makemkv-log.txt).", "The disc's menu could not be opened (see makemkv-log.txt)."), 10000)
+                rb.close(); stopMakeMkv(); return
+            }
+            remoteBd = rb
+            say("", 1)
+            main.post { bdOverlay.visibility = View.VISIBLE; open(uri, false, null) }
+        } catch (e: Throwable) {
+            mkLog("menu failed: ${android.util.Log.getStackTraceString(e)}")
+            say("$e"); stopMakeMkv()
+        }
+    }
+
+    /** A sound effect of a disc's menu (48 kHz, 16 bit), played once. */
+    private fun playPcm(data: ShortArray, ch: Int) {
+        kotlin.concurrent.thread {
+            try {
+                val track = android.media.AudioTrack.Builder()
+                    .setAudioAttributes(android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
+                    .setAudioFormat(android.media.AudioFormat.Builder().setSampleRate(48000).setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                        .setChannelMask(if (ch == 1) android.media.AudioFormat.CHANNEL_OUT_MONO else android.media.AudioFormat.CHANNEL_OUT_STEREO).build())
+                    .setBufferSizeInBytes(data.size * 2).setTransferMode(android.media.AudioTrack.MODE_STATIC).build()
+                track.write(data, 0, data.size); track.play()
+                Thread.sleep(data.size / ch * 1000L / 48000 + 200)
+                track.release()
+            } catch (_: Exception) { }
+        }
+    }
+
     /** Runs on a worker thread: lends the drive to MakeMKV, has it stream the title, plays the stream. */
     private fun startMakeMkv(uri: Uri) {
         val key = uri.host ?: return
@@ -1061,7 +1152,32 @@ class MainActivity : Activity() {
         js("(function(){var e=new KeyboardEvent('keydown',{keyCode:$code,which:$code,bubbles:true});document.dispatchEvent(e);})()")
     }
 
+    private fun bdKeyOf(code: Int): Int = when (code) {
+        KeyEvent.KEYCODE_DPAD_UP -> Bd.VK_UP
+        KeyEvent.KEYCODE_DPAD_DOWN -> Bd.VK_DOWN
+        KeyEvent.KEYCODE_DPAD_LEFT -> Bd.VK_LEFT
+        KeyEvent.KEYCODE_DPAD_RIGHT -> Bd.VK_RIGHT
+        KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> Bd.VK_ENTER
+        KeyEvent.KEYCODE_MENU -> Bd.VK_POPUP
+        KeyEvent.KEYCODE_MEDIA_TOP_MENU, KeyEvent.KEYCODE_GUIDE -> Bd.VK_ROOT_MENU
+        KeyEvent.KEYCODE_PROG_RED -> Bd.VK_RED
+        KeyEvent.KEYCODE_PROG_GREEN -> Bd.VK_GREEN
+        KeyEvent.KEYCODE_PROG_YELLOW -> Bd.VK_YELLOW
+        KeyEvent.KEYCODE_PROG_BLUE -> Bd.VK_BLUE
+        in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> code - KeyEvent.KEYCODE_0
+        else -> -1
+    }
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // a disc from MakeMKV with its own menu: the keys go to the menu
+        val rb = remoteBd
+        if (rb != null && rb.opened) {
+            val vk = bdKeyOf(event.keyCode)
+            if (vk >= 0) {
+                if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) kotlin.concurrent.thread { rb.key(vk) }
+                return true
+            }
+        }
         val b = bd
         if (b != null && b.opened) {
             val vk = when (event.keyCode) {
@@ -1140,6 +1256,7 @@ class MainActivity : Activity() {
                 val u = Uri.parse(url)
                 if (u.scheme == "bdnav") { startBd(u); return@thread }
                 if (u.scheme == "makemkv") { startMakeMkv(u); return@thread }
+                if (u.scheme == "makemenu") { startMakeMenu(u); return@thread }
                 val prepared = prepare(u)
                 main.post { open(u, hls, prepared) }
             }

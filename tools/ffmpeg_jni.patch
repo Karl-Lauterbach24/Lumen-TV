@@ -1,0 +1,117 @@
+--- /private/tmp/claude-501/-Users-domenikcloke/d8f9aa73-2d4c-4a34-b498-023a13ab8ca2/scratchpad/ffmpeg_jni.cc.orig	2026-10-17 15:24:42
++++ ffmpeg_jni.cc	2026-10-17 16:13:29
+@@ -30,6 +30,7 @@
+ #include <libavutil/error.h>
+ #include <libavutil/opt.h>
+ #include <libswresample/swresample.h>
++#include <libavutil/opt.h>
+ }
+ 
+ #define LOG_TAG "ffmpeg_jni"
+@@ -98,6 +99,13 @@
+  * written, or a negative AUDIO_DECODER_ERROR constant value in the case of an
+  * error.
+  */
++// Lumen: what the player was told the output is (the first layout); later frames of another layout are converted to it
++struct LumenOut {
++  SwrContext *swr;
++  AVChannelLayout layout;
++  bool set;
++};
++
+ int decodePacket(AVCodecContext *context, AVPacket *packet,
+                  uint8_t *outputBuffer, int outputSize,
+                  GrowOutputBufferCallback growBuffer);
+@@ -343,16 +351,51 @@
+     int sampleCount = frame->nb_samples;
+     int dataSize = av_samples_get_buffer_size(NULL, channelCount, sampleCount,
+                                               sampleFormat, 1);
+-    SwrContext *resampleContext = static_cast<SwrContext *>(context->opaque);
++    // Lumen: the frame, not the codec context, says what the decoder produced (DTS changes layout
++    // between frames); the output keeps the layout the player was told at first.
++    if (frame->nb_samples <= 0 || !frame->extended_data || !frame->extended_data[0] ||
++        frame->ch_layout.nb_channels <= 0) {
++      av_frame_free(&frame);
++      continue;
++    }
++    LumenOut *lo = static_cast<LumenOut *>(context->opaque);
++    if (!lo) {
++      lo = (LumenOut *)calloc(1, sizeof(LumenOut));
++      context->opaque = lo;
++    }
++    if (!lo->set) {
++      av_channel_layout_copy(&lo->layout, &frame->ch_layout);
++      lo->set = true;
++    }
++    { static int lastCh = -1; if (frame->ch_layout.nb_channels != lastCh) { lastCh = frame->ch_layout.nb_channels; LOGD("Frame has %d channels, the output keeps %d", lastCh, lo->layout.nb_channels); } }
++    channelCount = lo->layout.nb_channels;
++    sampleFormat = (AVSampleFormat)frame->format;
++    int inRate = frame->sample_rate > 0 ? frame->sample_rate : sampleRate;
++    SwrContext *resampleContext = lo->swr;
++    if (resampleContext) {
++      int64_t rate = 0, fmt = 0;
++      AVChannelLayout inLayout;
++      memset(&inLayout, 0, sizeof(inLayout));
++      av_opt_get_int(resampleContext, "in_sample_rate", 0, &rate);
++      av_opt_get_int(resampleContext, "in_sample_fmt", 0, &fmt);
++      av_opt_get_chlayout(resampleContext, "in_chlayout", 0, &inLayout);
++      bool same = rate == inRate && fmt == sampleFormat &&
++                  av_channel_layout_compare(&inLayout, &frame->ch_layout) == 0;
++      av_channel_layout_uninit(&inLayout);
++      if (!same) {
++        swr_free(&lo->swr);
++        resampleContext = NULL;
++      }
++    }
+     if (!resampleContext) {
+       result =
+           swr_alloc_set_opts2(&resampleContext,             // ps
+-                              &context->ch_layout,          // out_ch_layout
++                              &lo->layout,                  // out_ch_layout
+                               context->request_sample_fmt,  // out_sample_fmt
+                               sampleRate,                   // out_sample_rate
+-                              &context->ch_layout,          // in_ch_layout
++                              &frame->ch_layout,            // in_ch_layout
+                               sampleFormat,                 // in_sample_fmt
+-                              sampleRate,                   // in_sample_rate
++                              inRate,                       // in_sample_rate
+                               0,                            // log_offset
+                               NULL                          // log_ctx
+           );
+@@ -364,10 +407,11 @@
+       result = swr_init(resampleContext);
+       if (result < 0) {
+         logError("swr_init", result);
++        swr_free(&resampleContext);
+         av_frame_free(&frame);
+         return transformError(result);
+       }
+-      context->opaque = resampleContext;
++      lo->swr = resampleContext;
+     }
+ 
+     int outSampleSize = av_get_bytes_per_sample(context->request_sample_fmt);
+@@ -387,7 +431,7 @@
+       }
+     }
+     result = swr_convert(resampleContext, &outputBuffer, bufferOutSize,
+-                         (const uint8_t **)frame->data, frame->nb_samples);
++                         (const uint8_t **)frame->extended_data, frame->nb_samples);
+     av_frame_free(&frame);
+     if (result < 0) {
+       logError("swr_convert", result);
+@@ -421,9 +465,11 @@
+   if (!context) {
+     return;
+   }
+-  SwrContext *swrContext;
+-  if ((swrContext = (SwrContext *)context->opaque)) {
+-    swr_free(&swrContext);
++  LumenOut *lo = (LumenOut *)context->opaque;
++  if (lo) {
++    swr_free(&lo->swr);
++    av_channel_layout_uninit(&lo->layout);
++    free(lo);
+     context->opaque = NULL;
+   }
+   avcodec_free_context(&context);

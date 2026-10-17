@@ -14,6 +14,10 @@ mkdir -p "$work" && cd "$work"
 module="$work/media3/libraries/decoder_ffmpeg/src/main"
 ln -sfn "$work/ffmpeg" "$module/jni/ffmpeg"
 # API 21: the level Media3's own native library is linked for
+# no hand-written assembly: the NEON conversion of swresample (fltp to s16) crashed on a 32-bit television with 6 channels
+sed -i.bak "s/    --disable-symver/    --disable-symver\n    --disable-asm/" "$module/jni/build_ffmpeg.sh"
+# the resampler is built from each frame (DTS changes layout; the stock code used the first one and crashed on a null plane)
+patch -N -p0 "$module/jni/ffmpeg_jni.cc" < "$here/tools/ffmpeg_jni.patch" || true
 bash "$module/jni/build_ffmpeg.sh" "$module" "$ndk" "$host" 21 ac3 eac3 dca truehd mlp
 cp "$here/android/local.properties" media3/
 (cd media3 && ./gradlew -q :lib-decoder-ffmpeg:assembleRelease)
