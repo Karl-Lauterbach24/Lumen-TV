@@ -161,7 +161,12 @@ class MainActivity : Activity() {
                 when (state) {
                     Player.STATE_BUFFERING -> event("waiting")
                     Player.STATE_READY -> event(if (p.playWhenReady) "playing" else "pause")
-                    Player.STATE_ENDED -> event("ended")
+                    Player.STATE_ENDED -> {
+                        // the disc's menu: its stream ends where the streams change (bdmenu says RESTART) and goes on in a new one
+                        val rb = remoteBd
+                        if (rb != null && rb.opened) { mkLog("disc menu: the stream goes on in a new one"); restartMenuStream(p, rb) }
+                        else event("ended")
+                    }
                 }
             }
             override fun onIsPlayingChanged(isPlaying: Boolean) { event(if (isPlaying) "playing" else "pause") }
@@ -313,12 +318,7 @@ class MainActivity : Activity() {
             p.setMediaSource(source)
         } else if (uri.scheme == "makemenu") {
             val rb = remoteBd ?: return
-            val extractors = androidx.media3.extractor.DefaultExtractorsFactory()
-                .setTsExtractorFlags(BLURAY_TS_FLAGS)
-                .setConstantBitrateSeekingEnabled(false)
-            val source = androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(FifoDataSource.Factory(rb.fifo), extractors)
-                .createMediaSource(MediaItem.fromUri(uri))
-            p.setMediaSource(source)
+            p.setMediaSource(menuSource(rb))
         } else if (uri.scheme == "disc") {
             // a file of a disc the app reads itself
             val factory = DiscDataSource.Factory { key, path -> discs.reader(key, path) }
@@ -406,6 +406,21 @@ class MainActivity : Activity() {
             m
         }
         main.post { (if (plane == 0) bdPg else bdIg).apply { setImageBitmap(bmp); invalidate() } }
+    }
+
+    /** The stream of the disc's menu (a fresh extractor each time: one stream has one format per track). */
+    private fun menuSource(rb: RemoteBd): androidx.media3.exoplayer.source.MediaSource {
+        val extractors = androidx.media3.extractor.DefaultExtractorsFactory()
+            .setTsExtractorFlags(BLURAY_TS_FLAGS)
+            .setConstantBitrateSeekingEnabled(false)
+        return androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(FifoDataSource.Factory(rb.fifo), extractors)
+            .createMediaSource(MediaItem.fromUri("makemenu://stream/${System.nanoTime()}"))
+    }
+
+    private fun restartMenuStream(p: ExoPlayer, rb: RemoteBd) {
+        p.setMediaSource(menuSource(rb))
+        p.prepare()
+        p.playWhenReady = true
     }
 
     private fun closeBd() {

@@ -29,7 +29,9 @@ class RemoteBd(private val makemkv: MakeMkv, private val log: (String) -> Unit) 
         private set
 
     private var process: Process? = null
-    val fifo: File get() = File(makemkv.menuDir(), "ts.fifo")
+    /** Where the stream comes now: ts.fifo, then ts.fifo.1, .2 … after each change of the streams (see bdmenu's RESTART). */
+    @Volatile var fifo: File = File(makemkv.menuDir(), "ts.fifo")
+        private set
 
     /** Starts the player of the disc and waits until it is ready (the disc is opened, decrypted: up to a few minutes). */
     fun start(lang: String, stop: () -> Boolean): Boolean {
@@ -50,6 +52,10 @@ class RemoteBd(private val makemkv: MakeMkv, private val log: (String) -> Unit) 
                         l.startsWith("CLEAR ") -> overlay?.invoke(l.substringAfter(' ').trim().toIntOrNull() ?: 1, 0, 0, 0, 0, null)
                         l.startsWith("SOUND ") -> sound(l)
                         l.startsWith("ERROR") || l.startsWith("DISC") -> log("bdmenu: $l")
+                        l.startsWith("RESTART ") -> {
+                            fifo = File(l.substringAfter(' ').trim().replace("/tmp/menu", makemkv.menuDir().absolutePath))
+                            log("bdmenu: the streams change, the stream goes on in ${fifo.name}")
+                        }
                     }
                 }
             } catch (_: java.io.IOException) { }

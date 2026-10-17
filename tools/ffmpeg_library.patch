@@ -1,0 +1,10 @@
+--- /private/tmp/claude-501/-Users-domenikcloke/d8f9aa73-2d4c-4a34-b498-023a13ab8ca2/scratchpad/FfmpegLibrary.java.orig	2026-10-17 21:15:35
++++ libraries/decoder_ffmpeg/src/main/java/androidx/media3/decoder/ffmpeg/FfmpegLibrary.java	2026-10-17 21:15:35
+@@ -132,6 +132,7 @@
+         return "truehd";
+       case MimeTypes.AUDIO_DTS:
+       case MimeTypes.AUDIO_DTS_HD:
++      case MimeTypes.AUDIO_DTS_EXPRESS: // Lumen: DTS Express (LBR), which the dca decoder also reads
+         return "dca";
+       case MimeTypes.AUDIO_VORBIS:
+         return "vorbis";

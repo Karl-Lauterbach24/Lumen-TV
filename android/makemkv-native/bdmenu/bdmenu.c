@@ -315,14 +315,21 @@ static uint32_t crc32_mpeg(const uint8_t *d, int n)
 }
 static int g_pmt_pid = -1, g_pmt_dn = -1;
 static char g_pmt_desc[160];
-static void fix_pmt(uint8_t *buf, int len)
+static uint8_t g_pat[188];
+static int g_have_pat;
+static int map_type(int st) { return (st == 0x85 || st == 0x86 || st == 0xa2) ? 0x82 : (st == 0x84 || st == 0xa1) ? 0x87 : st; }
+/* returns the offset of a PMT whose streams differ from the last one (the player cannot change a track's format: the stream is
+   started anew there), or -1 */
+static int fix_pmt(uint8_t *buf, int len)
 {
+    int cut = -1;
     for (int o = 0; o + 188 <= len; o += 188) {
         uint8_t *p = buf + o;
         if (p[0] != 0x47) continue;
         int pid = ((p[1] & 0x1f) << 8) | p[2];
         int pusi = p[1] & 0x40;
         if (pid == 0 && pusi && (p[3] & 0x10)) {
+            memcpy(g_pat, p, 188); g_have_pat = 1;
             uint8_t *s = p + 5 + p[4];
             int sl = ((s[1] & 0xf) << 8) | s[2];
             if (s[0] == 0) for (int j = 8; j + 4 <= 3 + sl - 4 && j + 4 < 180; j += 4) if (((s[j] << 8) | s[j + 1]) != 0) { g_pmt_pid = ((s[j + 2] & 0x1f) << 8) | s[j + 3]; break; }
@@ -335,8 +342,11 @@ static void fix_pmt(uint8_t *buf, int len)
             int i = 12 + pil, end = 3 + sl - 4, changed = 0;
             char desc[160]; int dn = 0;
             for (int j = i; j + 5 <= end && dn < 140; j += 5 + (((s[j + 3] & 0xf) << 8) | s[j + 4]))
-                dn += snprintf(desc + dn, sizeof(desc) - (size_t)dn, " %02x:%04x", s[j], ((s[j + 1] & 0x1f) << 8) | s[j + 2]);
-            if (dn != g_pmt_dn || memcmp(desc, g_pmt_desc, (size_t)dn)) { memcpy(g_pmt_desc, desc, (size_t)dn); g_pmt_dn = dn; fprintf(stderr, "PMT%.*s\n", dn, desc); }
+                dn += snprintf(desc + dn, sizeof(desc) - (size_t)dn, " %02x:%04x", map_type(s[j]), ((s[j + 1] & 0x1f) << 8) | s[j + 2]);
+            if (dn != g_pmt_dn || memcmp(desc, g_pmt_desc, (size_t)dn)) {
+                if (g_pmt_dn >= 0 && cut < 0) cut = o;
+                memcpy(g_pmt_desc, desc, (size_t)dn); g_pmt_dn = dn; fprintf(stderr, "PMT%.*s\n", dn, desc);
+            }
             while (i + 5 <= end) {
                 int st = s[i], l = ((s[i + 3] & 0xf) << 8) | s[i + 4];
                 int to = st;
@@ -350,7 +360,103 @@ static void fix_pmt(uint8_t *buf, int len)
                 s[end] = (uint8_t)(c >> 24); s[end + 1] = (uint8_t)(c >> 16); s[end + 2] = (uint8_t)(c >> 8); s[end + 3] = (uint8_t)c;
             }
         }
+    }    return cut;
+}
+
+
+/*
+ * DTS-HD (Master Audio, High Resolution): each PES holds a DTS core frame and an extension substream. The player's DTS reader takes
+ * parts of the extension for "DTS Express" and its decoder fails on them; the core alone is plain DTS. So the PES of these PIDs are
+ * collected, cut after the core frame and packed into transport packets again.
+ */
+#define MAXDTS 4
+static int g_dts_pid[MAXDTS], g_dts_n;
+static uint8_t g_pes[MAXDTS][65536];
+static int g_pes_len[MAXDTS], g_cc[MAXDTS];
+
+static int dts_index(int pid) { for (int i = 0; i < g_dts_n; ++i) if (g_dts_pid[i] == pid) return i; return -1; }
+
+static void learn_dts(const uint8_t *p)
+{
+    /* (a PMT: which PIDs carry DTS-HD; taken before fix_pmt rewrites the types) */
+    const uint8_t *s = p + 5 + p[4];
+    if (s[0] != 2) return;
+    int sl = ((s[1] & 0xf) << 8) | s[2];
+    if (5 + p[4] + 3 + sl > 188) return;
+    int pil = ((s[10] & 0xf) << 8) | s[11];
+    int i = 12 + pil, end = 3 + sl - 4, n = 0, pids[MAXDTS];
+    static char last[200];
+    char d[200]; int dn = 0;
+    for (int j = i; j + 5 <= end && dn < 180; j += 5 + (((s[j + 3] & 0xf) << 8) | s[j + 4]))
+        dn += snprintf(d + dn, sizeof(d) - (size_t)dn, " %02x:%04x", s[j], ((s[j + 1] & 0x1f) << 8) | s[j + 2]);
+    d[dn] = 0;
+    if (strcmp(d, last)) { strcpy(last, d); fprintf(stderr, "PMT on the disc:%s\n", d); }
+    while (i + 5 <= end) {
+        int st = s[i], pid = ((s[i + 1] & 0x1f) << 8) | s[i + 2], l = ((s[i + 3] & 0xf) << 8) | s[i + 4];
+        if ((st == 0x85 || st == 0x86) && n < MAXDTS) pids[n++] = pid;
+        i += 5 + l;
     }
+    for (int k = 0; k < n; ++k) if (dts_index(pids[k]) < 0 && g_dts_n < MAXDTS) { g_dts_pid[g_dts_n] = pids[k]; g_pes_len[g_dts_n] = 0; g_dts_n++; }
+}
+
+/* packs the collected PES of entry [k] (cut after its core frame) into transport packets at [out]; returns the bytes written */
+static int flush_dts(int k, uint8_t *out)
+{
+    uint8_t *e = g_pes[k];
+    int n = g_pes_len[k];
+    g_pes_len[k] = 0;
+    if (n < 9 || e[0] || e[1] || e[2] != 1) return 0;
+    int hl = 9 + e[8];
+    /* a PES of the extension substream alone (some discs put core and extension in PES of their own): left out */
+    if (hl + 4 <= n && e[hl] == 0x64 && e[hl + 1] == 0x58 && e[hl + 2] == 0x20 && e[hl + 3] == 0x25) return 0;
+    if (hl + 10 <= n && e[hl] == 0x7f && e[hl + 1] == 0xfe && e[hl + 2] == 0x80 && e[hl + 3] == 0x01) {
+        int fsize = (((e[hl + 5] & 3) << 12) | (e[hl + 6] << 4) | (e[hl + 7] >> 4)) + 1;
+        if (fsize > 95 && hl + fsize < n) {
+            n = hl + fsize;
+            int plen = n - 6;
+            e[4] = (uint8_t)(plen >> 8); e[5] = (uint8_t)plen;
+        }
+    }
+    int w = 0, at = 0, pid = g_dts_pid[k];
+    while (at < n) {
+        uint8_t *p = out + w;
+        int left = n - at, take = left < 184 ? left : 184;
+        p[0] = 0x47; p[1] = (uint8_t)(((at == 0) ? 0x40 : 0) | (pid >> 8)); p[2] = (uint8_t)pid;
+        if (take == 184) { p[3] = (uint8_t)(0x10 | (g_cc[k] & 0xf)); memcpy(p + 4, e + at, 184); }
+        else {
+            int af = 183 - take;                 /* adaptation field length; stuffing fills the packet */
+            p[3] = (uint8_t)(0x30 | (g_cc[k] & 0xf));
+            p[4] = (uint8_t)af;
+            if (af > 0) { p[5] = 0; memset(p + 6, 0xff, (size_t)(af - 1)); }
+            memcpy(p + 5 + af, e + at, (size_t)take);
+        }
+        g_cc[k]++; at += take; w += 188;
+    }
+    return w;
+}
+
+/* [in] (n bytes of 188-byte packets) to [out]: DTS-HD PES reduced to their core; returns the bytes in [out] */
+static int strip_dtshd(const uint8_t *in, int n, uint8_t *out)
+{
+    int w = 0;
+    for (int o = 0; o + 188 <= n; o += 188) {
+        const uint8_t *p = in + o;
+        int pid = ((p[1] & 0x1f) << 8) | p[2];
+        if (pid == 0 && (p[1] & 0x40) && (p[3] & 0x10)) {
+            const uint8_t *s = p + 5 + p[4];
+            int sl = ((s[1] & 0xf) << 8) | s[2];
+            if (s[0] == 0) for (int j = 8; j + 4 <= 3 + sl - 4 && j + 4 < 180; j += 4) if (((s[j] << 8) | s[j + 1]) != 0) { g_pmt_pid = ((s[j + 2] & 0x1f) << 8) | s[j + 3]; break; }
+        } else if (pid == g_pmt_pid && (p[1] & 0x40) && (p[3] & 0x10)) learn_dts(p);
+        int k = dts_index(pid);
+        if (k < 0 || !(p[3] & 0x10)) { memcpy(out + w, p, 188); w += 188; continue; }
+        int at = 4;
+        if (p[3] & 0x20) at = 5 + p[4];
+        if (at > 188) continue;
+        if (p[1] & 0x40) w += flush_dts(k, out + w);
+        int len = 188 - at;
+        if (g_pes_len[k] + len <= (int)sizeof(g_pes[k])) { memcpy(g_pes[k] + g_pes_len[k], p + at, (size_t)len); g_pes_len[k] += len; }
+    }
+    return w;
 }
 
 static int sv_dirty[2], sv_x0[2], sv_y0[2], sv_x1[2], sv_y1[2];
@@ -421,6 +527,29 @@ static void sv_overlay(void *handle, const BD_OVERLAY *ov)
     }
 }
 
+/* opens the writing end of the fifo once the player has opened its end; -1 when told to quit meanwhile */
+static int open_fifo(const char *fifo)
+{
+    int fd = -1;
+    while (fd < 0) {
+        fd = open(fifo, O_WRONLY | O_NONBLOCK);
+        if (fd < 0) { usleep(50000); fd_set fs; struct timeval tv = { 0, 0 }; FD_ZERO(&fs); FD_SET(0, &fs); if (select(1, &fs, NULL, NULL, &tv) > 0) { char l[64]; if (!fgets(l, sizeof(l), stdin) || !strncmp(l, "quit", 4)) return -1; } }
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+    return fd;
+}
+
+static int write_all(int fd, const uint8_t *b, int n)
+{
+    int done = 0;
+    while (done < n) {
+        ssize_t r = write(fd, b + done, (size_t)(n - done));
+        if (r < 0) { if (errno == EINTR) continue; fprintf(stderr, "END writing the stream: %s\n", strerror(errno)); return -1; }
+        done += (int)r;
+    }
+    return 0;
+}
+
 static int serve(const char *device, const char *fifo, const char *lang)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -441,13 +570,9 @@ static int serve(const char *device, const char *fifo, const char *lang)
     if (!bd_play(bd)) { printf("ERROR play\n"); return 1; }
     printf("READY\n"); fflush(stdout);
     /* the stream goes into the fifo once the player has opened its end */
-    int fd = -1;
-    while (fd < 0) {
-        fd = open(fifo, O_WRONLY | O_NONBLOCK);
-        if (fd < 0) { usleep(100000); fd_set fs; struct timeval tv = { 0, 0 }; FD_ZERO(&fs); FD_SET(0, &fs); if (select(1, &fs, NULL, NULL, &tv) > 0) { char l[64]; if (!fgets(l, sizeof(l), stdin) || !strncmp(l, "quit", 4)) { bd_close(bd); return 0; } } }
-    }
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
-    static unsigned char tmp[6144 * 8], out[188 * 32 * 8];
+    int fd = open_fifo(fifo);
+    if (fd < 0) { bd_close(bd); return 0; }
+    static unsigned char tmp[6144 * 8], out[188 * 32 * 8], out2[188 * 32 * 8 + 65536 * 2];
     for (;;) {
         BD_EVENT ev;
         ev.event = BD_EVENT_NONE;
@@ -465,17 +590,31 @@ static int serve(const char *device, const char *fifo, const char *lang)
             }
         }
         while (bd_get_event(bd, &ev) && ev.event != BD_EVENT_NONE) event_name(&ev);
-        if (n < 0) break;
+        if (n < 0) { fprintf(stderr, "END bd_read_ext returned %d\n", n); break; }
         if (n > 0) {
             int w = 0;
             for (int o = 0; o + 192 <= n && w + 188 <= (int)sizeof(out); o += 192) { memcpy(out + w, tmp + o + 4, 188); w += 188; }
             retime(out, w);
-            fix_pmt(out, w);
-            int done = 0;
-            while (done < w) {
-                ssize_t r = write(fd, out + done, (size_t)(w - done));
-                if (r < 0) { if (errno == EINTR) continue; goto end; }      /* the player is gone */
-                done += (int)r;
+            w = strip_dtshd(out, w, out2);
+            uint8_t *buf = out2;
+            int cut = fix_pmt(buf, w);
+            if (cut < 0) { if (write_all(fd, buf, w) < 0) goto end; }
+            else {
+                /* the streams changed (another audio format on the same PID: menu and film): the player's stream ends here and
+                   a new one starts with the new PMT (preceded by the PAT); the app plays the old one out and opens the new one */
+                if (write_all(fd, buf, cut) < 0) goto end;
+                close(fd);
+                /* a fifo of its own for the new stream: the old one is still open for the player's old reader */
+                static char next[512];
+                static int seg;
+                snprintf(next, sizeof(next), "%s.%d", fifo, ++seg);
+                unlink(next);
+                if (mkfifo(next, 0666) < 0) { fprintf(stderr, "END mkfifo %s: %s\n", next, strerror(errno)); goto end; }
+                printf("RESTART %s\n", next); fflush(stdout);
+                fd = open_fifo(next);
+                if (fd < 0) goto end;
+                if (g_have_pat && write_all(fd, g_pat, 188) < 0) goto end;
+                if (write_all(fd, buf + cut, w - cut) < 0) goto end;
             }
         } else usleep(15000);
         fd_set fs;
@@ -483,11 +622,11 @@ static int serve(const char *device, const char *fifo, const char *lang)
         FD_ZERO(&fs); FD_SET(0, &fs);
         while (select(1, &fs, NULL, NULL, &tv) > 0) {
             char line[128]; int a = 0;
-            if (!fgets(line, sizeof(line), stdin)) goto end;
+            if (!fgets(line, sizeof(line), stdin)) { fprintf(stderr, "END stdin closed\n"); goto end; }
             if (sscanf(line, "key %d", &a) == 1) { bd_user_input(bd, -1, (uint32_t)a); }
             else if (!strncmp(line, "menu", 4)) bd_menu_call(bd, -1);
             else if (sscanf(line, "title %d", &a) == 1) bd_play_title(bd, (unsigned)a);
-            else if (!strncmp(line, "quit", 4)) goto end;
+            else if (!strncmp(line, "quit", 4)) { fprintf(stderr, "END quit\n"); goto end; }
             FD_ZERO(&fs); FD_SET(0, &fs);
         }
     }

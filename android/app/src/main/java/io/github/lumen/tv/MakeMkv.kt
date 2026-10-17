@@ -36,7 +36,11 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     private val prefs = activity.getSharedPreferences("makemkv", Activity.MODE_PRIVATE)
     private val usb = activity.getSystemService(UsbManager::class.java)
 
-    companion object { var READ_BUFFER_MB = 16 }
+    companion object {
+        var READ_BUFFER_MB = 16
+        @Volatile private var bridgeOwner: MakeMkv? = null
+        private var bridgeServer: Thread? = null
+    }
 
     /** A stream of a title, from MakeMKV's SINFO: [type] "audio" / "text" / "video", [lang] ISO 639-1 where known. */
     class Stream(val type: String, val lang: String, val langName: String, val codec: String, val channels: Int,
@@ -293,7 +297,6 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     private var epIn: UsbEndpoint? = null
     private var epOut: UsbEndpoint? = null
     private var bridgeInfo = ""
-    private var server: Thread? = null
 
     fun drive(): UsbDevice? = usb.deviceList.values.firstOrNull { d ->
         (0 until d.interfaceCount).any { d.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_MASS_STORAGE }
@@ -322,18 +325,24 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         pfd = ParcelFileDescriptor.fromFd(c.fileDescriptor)
         bridgeInfo = "${epIn!!.address} ${epOut!!.address} ${intf.id}"
         log("bridge: ${device.productName} at ${device.deviceName}, endpoints $bridgeInfo")
-        if (server == null) server = kotlin.concurrent.thread(isDaemon = true) {
-            try {
-                val s = android.net.LocalServerSocket("lumen.mmshim.usb")
-                while (true) {
-                    val a = s.accept()
-                    try {
-                        val fd = pfd ?: continue
-                        a.setFileDescriptorsForSend(arrayOf(fd.fileDescriptor))
-                        a.outputStream.write((bridgeInfo + "\n").toByteArray()); a.outputStream.flush()
-                    } finally { a.close() }
-                }
-            } catch (e: Exception) { log("bridge server stopped: $e") }
+        // one server for the whole process (the activity can be made anew, e.g. when the drive is plugged in): it hands out the drive
+        // of the instance that opened it last
+        bridgeOwner = this
+        synchronized(Companion) {
+            if (bridgeServer == null) bridgeServer = kotlin.concurrent.thread(isDaemon = true) {
+                try {
+                    val s = android.net.LocalServerSocket("lumen.mmshim.usb")
+                    while (true) {
+                        val a = s.accept()
+                        try {
+                            val owner = bridgeOwner ?: continue
+                            val fd = owner.pfd ?: continue
+                            a.setFileDescriptorsForSend(arrayOf(fd.fileDescriptor))
+                            a.outputStream.write((owner.bridgeInfo + "\n").toByteArray(Charsets.UTF_8)); a.outputStream.flush()
+                        } finally { a.close() }
+                    }
+                } catch (e: Exception) { log("bridge server stopped: $e"); synchronized(Companion) { bridgeServer = null } }
+            }
         }
         return true
     }
@@ -684,6 +693,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     fun stop() {
         proc?.destroy(); proc = null
     }
+
 }
 
 /** The pipe MakeMKV writes into, read in order: the player gets it as a stream of unknown length. */

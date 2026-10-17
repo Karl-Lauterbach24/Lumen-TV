@@ -18,6 +18,8 @@ ln -sfn "$work/ffmpeg" "$module/jni/ffmpeg"
 sed -i.bak "s/    --disable-symver/    --disable-symver\n    --disable-asm/" "$module/jni/build_ffmpeg.sh"
 # the resampler is built from each frame (DTS changes layout; the stock code used the first one and crashed on a null plane)
 patch -N -p0 "$module/jni/ffmpeg_jni.cc" < "$here/tools/ffmpeg_jni.patch" || true
+# DTS Express (LBR) goes to the dca decoder too (a Blu-ray menu's sound switched to it and the renderer failed)
+patch -N -p0 "$module/java/androidx/media3/decoder/ffmpeg/FfmpegLibrary.java" < "$here/tools/ffmpeg_library.patch" || true
 bash "$module/jni/build_ffmpeg.sh" "$module" "$ndk" "$host" 21 ac3 eac3 dca truehd mlp
 cp "$here/android/local.properties" media3/
 (cd media3 && ./gradlew -q :lib-decoder-ffmpeg:assembleRelease)
