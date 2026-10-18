@@ -90,9 +90,9 @@ class MainActivity : Activity() {
         discs.nameFor = { key -> mkDiscName(key) }
         discs.coverFor = { key, label ->
             // (a drive whose disc is not read yet has only its own name: no picture for that – it would be some earlier disc's)
-            if (mkLabels[key] == null && discs.label(key).isEmpty()) return@coverFor ""
+            val unread = mkLabels[key] == null && discs.label(key).isEmpty()
             val l = mkLabels[key] ?: label
-            val c = ownCover(key, l).ifEmpty { makemkv.cover(l) }
+            val c = if (unread) "" else ownCover(key, l).ifEmpty { makemkv.cover(l) }
             // a disc seen before: its titles from the memory (name, picture), once per start
             if (key.startsWith("usb") && makemkv.available && mkTitles[key] == null && makemkv.hasTitles(l) && mkCoverTried.add(key)) kotlin.concurrent.thread {
                 makemkv.loadTitles(l)?.let { mkLabels[key] = l; mkTitles[key] = it; mkLookup(key, it) }
