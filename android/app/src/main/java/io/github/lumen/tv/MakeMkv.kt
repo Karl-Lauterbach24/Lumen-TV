@@ -68,7 +68,8 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
                 val todo = ArrayDeque(listOf(root))
                 while (todo.isNotEmpty()) { val q = todo.removeFirst(); for (c in childrenOf(q)) { kids.add(c); todo.add(c) } }
                 for (k in kids) try { android.os.Process.sendSignal(k, 15) } catch (_: Exception) { }
-                val until = System.currentTimeMillis() + 10_000
+                // (a command can take long – a disc read with retries: the processes end once it is answered)
+                val until = System.currentTimeMillis() + 25_000
                 while (System.currentTimeMillis() < until && kids.any { java.io.File("/proc/$it").exists() }) Thread.sleep(100)
             }
             p.destroy()
@@ -748,7 +749,14 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     fun menuDir(): File = File(root, "tmp/menu")
 
     fun stop() {
-        proc?.let { p -> kotlin.concurrent.thread { stopGently(p) } }; proc = null
+        proc?.let { p -> ending = p; kotlin.concurrent.thread { stopGently(p) } }; proc = null
+    }
+    @Volatile private var ending: Process? = null
+    /** Ends makemkvcon and waits until it has (its last USB command answered): only then may the bridge to the drive be closed. */
+    fun stopAndWait() {
+        proc?.let { p -> proc = null; stopGently(p) }
+        ending?.let { p -> try { p.waitFor(30, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) { } }
+        ending = null
     }
 
 
@@ -913,6 +921,14 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
             } else i++
         }
         tail = w.copyOfRange(maxOf(0, w.size - 30), w.size)
+    }
+
+    /** The span of the film the cache holds (ms of the first and the last cluster in it): where the player can jump to. */
+    fun cachedRangeMs(): Pair<Long, Long>? = synchronized(lock) {
+        val oldest = maxOf(0L, written - capacity)
+        var first = -1L
+        for (k in idxMs.indices) if (idxPos[k] >= oldest) { first = idxMs[k]; break }
+        if (first < 0) null else first to idxMs[idxMs.size - 1]
     }
 
     /** The cluster to start again from for the picture at [timeUs]: the last one before it still in the cache (else the first there is). */

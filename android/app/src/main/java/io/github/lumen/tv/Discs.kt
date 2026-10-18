@@ -91,7 +91,9 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     var extraEntries: ((key: String, rel: String) -> List<JSONObject>)? = null
 
     /** A protected Blu-ray this app cannot decrypt itself (its key is not in the key database). */
-    fun label(key: String): String = synchronized(open) { open[key] }?.label.orEmpty()
+    fun label(key: String): String = synchronized(open) { open[key] }?.takeIf { it.note != "noanswer" }?.label.orEmpty()
+    /** The drive [key] has stopped answering (its USB bridge hangs): only switching it off and on helps. */
+    fun noAnswer(key: String): Boolean = synchronized(open) { open[key] }?.note == "noanswer"
 
     /**
      * A disc that asks for bus encryption in a drive that does it, with no session key and no LibreDrive: its streams must not be read
@@ -318,7 +320,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
                 // (looked at no more often than every 8 seconds: every question wakes the drive)
                 val ask = now - cached.lastLook > 8000
                 if (ask) cached.lastLook = now
-                val stale = cached.note == "empty" || cached.note == "unreadable" ||
+                val stale = cached.note == "empty" || cached.note == "unreadable" || cached.note == "noanswer" ||
                     (ask && (cached.source as? UsbBlockSource)?.mediaChanged() == true)
                 if (!stale) { if (cached.encrypted) lookupKeys(cached); out.add(cached); continue }
                 synchronized(open) { open.remove(key)?.source?.close() }
@@ -408,7 +410,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
                 android.util.Log.i("LumenTV", "USB reset of the drive: ${if (ok) "done" else "not possible"}")
             }
             src.close()
-            return Disc(key, name, "", null, null, false, "unreadable")
+            return Disc(key, name, "", null, null, false, "noanswer")
         }
     }
     private val lastReset = HashMap<String, Long>()
@@ -446,6 +448,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
                 "reading" -> t("Disc wird gelesen …", "reading the disc …")
                 "empty" -> t("keine Disc", "no disc")
                 "unreadable" -> t("nicht lesbar", "cannot be read")
+                "noanswer" -> t("Laufwerk antwortet nicht – bitte aus- und wieder einschalten", "the drive does not answer – switch it off and on")
                 "makemkv" -> t("von MakeMKV benutzt", "in use by MakeMKV")
                 else -> listOf(d.kind, if (d.encrypted) (if (d.keys != null) t("AACS, Schlüssel bekannt", "AACS, key known") else "AACS") else "").filter { it.isNotEmpty() }.joinToString(" · ")
             }

@@ -226,8 +226,11 @@ static int bot_locked(const uint8_t *cdb, int cdb_len, int dir_in, uint8_t *data
 
 /*
  * Stopping without hanging the drive: a process killed between a command and its status leaves the drive's USB bridge waiting
- * for good (only switching it off helps). SIGTERM is therefore held while a command runs and acted on right after it.
+ * for good (only switching it off helps). SIGTERM is therefore held while a command runs and acted on right after it – and so are
+ * the other signals that end a process: SIGHUP, SIGINT and SIGPIPE (the app closed the stream MakeMKV writes into; where
+ * MakeMKV ignores or handles SIGPIPE itself, it keeps that).
  */
+static int ends(int sig) { return sig == SIGTERM || sig == SIGHUP || sig == SIGINT; }
 static volatile sig_atomic_t in_command, term_pending;
 static void on_term(int sig)
 {
@@ -874,6 +877,9 @@ __attribute__((constructor)) static void mmshim_children(void)
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_term;
     sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGPIPE, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
     if (logging >= 3 && !getenv("LD_PRELOAD")) setenv("LD_PRELOAD", "/usr/lib/libmmshim.so", 1);
     if (logging >= 3) { char exe[256] = ""; ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1); if (n > 0) exe[n] = 0; LOG("process %d (parent %d) %s", (int)getpid(), (int)getppid(), exe); }
 }
@@ -891,12 +897,18 @@ int execve(const char *path, char *const argv[], char *const envp[])
     return re(path, argv, envp);
 }
 
-/* MakeMKV's own handler for SIGTERM would end it in the middle of a command: ours stays */
+/* MakeMKV's own handler for these signals would end it in the middle of a command: ours stays */
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old)
 {
     static int (*rs)(int, const struct sigaction *, struct sigaction *);
     if (!rs) rs = dlsym(RTLD_NEXT, "sigaction");
-    if (sig == SIGTERM && act && act->sa_handler != on_term) return old ? rs(sig, NULL, old) : 0;
+    if (ends(sig) && act && act->sa_handler != on_term) return old ? rs(sig, NULL, old) : 0;
+    /* SIGPIPE may be ignored or handled (the network code does that), only its default (the end) is ours */
+    if (sig == SIGPIPE && act && !(act->sa_flags & SA_SIGINFO) && act->sa_handler == SIG_DFL) {
+        struct sigaction a = *act;
+        a.sa_handler = on_term;
+        return rs(sig, &a, old);
+    }
     return rs(sig, act, old);
 }
 
@@ -904,6 +916,7 @@ __sighandler_t signal(int sig, __sighandler_t h)
 {
     static __sighandler_t (*rs)(int, __sighandler_t);
     if (!rs) rs = dlsym(RTLD_NEXT, "signal");
-    if (sig == SIGTERM && h != on_term) return SIG_DFL;
+    if (ends(sig) && h != on_term) return SIG_DFL;
+    if (sig == SIGPIPE && h == SIG_DFL) h = on_term;
     return rs(sig, h);
 }

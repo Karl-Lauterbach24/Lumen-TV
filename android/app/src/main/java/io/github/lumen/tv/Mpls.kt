@@ -1,7 +1,11 @@
 package io.github.lumen.tv
 
-/** A Blu-ray playlist (BDMV/PLAYLIST/xxxxx.mpls): which clips, in which order, for how long. */
-class Playlist(val name: String, val clips: List<String>, val seconds: Double) {
+/**
+ * A Blu-ray playlist (BDMV/PLAYLIST/xxxxx.mpls): which clips, in which order, for how long, and its chapters
+ * ([marks]: the entry marks, in seconds of the playlist; [clipMarks]: the same per clip, in seconds of that clip).
+ */
+class Playlist(val name: String, val clips: List<String>, val seconds: Double,
+               val marks: List<Double> = emptyList(), val clipMarks: Map<String, List<Double>> = emptyMap()) {
     companion object {
         fun parse(name: String, b: ByteArray): Playlist? {
             fun u16(o: Int) = ((b[o].toInt() and 0xff) shl 8) or (b[o + 1].toInt() and 0xff)
@@ -12,6 +16,8 @@ class Playlist(val name: String, val clips: List<String>, val seconds: Double) {
                 val count = u16(p + 6)
                 p += 10
                 val clips = ArrayList<String>()
+                val starts = ArrayList<Long>()
+                val ins = ArrayList<Long>()
                 var ticks = 0L
                 for (i in 0 until count) {
                     val len = u16(p)
@@ -20,12 +26,33 @@ class Playlist(val name: String, val clips: List<String>, val seconds: Double) {
                     val tin = u32((p + 14).toLong())
                     val tout = u32((p + 18).toLong())
                     clips.add(clip)
+                    starts.add(ticks); ins.add(tin)
                     ticks += tout - tin
                     p += len + 2
                     if (multiAngle) { /* the angles are alternates: the first is used */ }
                 }
                 if (clips.isEmpty()) return null
-                return Playlist(name, clips, ticks / 45000.0)
+                // the marks: u32 length, u16 count, then 14 bytes each (type 1: an entry mark, a chapter)
+                val marks = ArrayList<Double>()
+                val clipMarks = HashMap<String, ArrayList<Double>>()
+                try {
+                    val m = u32(12).toInt()
+                    val n = u16(m + 4)
+                    for (k in 0 until n) {
+                        val o = m + 6 + k * 14
+                        if (o + 14 > b.size) break
+                        if (b[o + 1].toInt() != 1) continue
+                        val item = u16(o + 2)
+                        if (item >= clips.size) continue
+                        val at = u32((o + 4).toLong()) - ins[item]
+                        if (at < 0) continue
+                        marks.add((starts[item] + at) / 45000.0)
+                        clipMarks.getOrPut(clips[item]) { ArrayList() }.add(at / 45000.0)
+                    }
+                } catch (_: Exception) { }
+                fun tidy(l: List<Double>, end: Double) = l.sorted().fold(ArrayList<Double>()) { a, x ->
+                    if ((a.isEmpty() || x - a.last() >= 1.0) && (end <= 0 || x < end - 2)) a.add(x); a }
+                return Playlist(name, clips, ticks / 45000.0, tidy(marks, ticks / 45000.0), clipMarks.mapValues { tidy(it.value, 0.0) })
             } catch (_: Exception) { return null }
         }
     }

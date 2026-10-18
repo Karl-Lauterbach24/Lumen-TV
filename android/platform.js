@@ -29,8 +29,9 @@
     try { e = new Event(name); } catch (x) { e = document.createEvent('Event'); e.initEvent(name, false, false); }
     video.dispatchEvent(e);
   }
-  window.__lumenEvent = function (name, pos, dur, paused) {
+  window.__lumenEvent = function (name, pos, dur, paused, buffered, waiting) {
     state.pos = pos / 1000; state.dur = dur / 1000; state.paused = paused;
+    state.buf = (buffered || 0) / 1000; state.waiting = !!waiting;
     var v = proxied;
     if (!v) return;
     if (name === 'error') { if (failed) failed(); return; }
@@ -47,6 +48,8 @@
     def('currentTime', function () { return state.pos; }, function (t) { state.pos = t; N.seek(t * 1000); });
     def('duration', function () { return state.dur; });
     def('paused', function () { return state.paused; });
+    def('lumenBuffered', function () { return state.buf || 0; });
+    def('lumenWaiting', function () { return !!state.waiting; });
     video.play = function () { N.resume(); state.paused = false; return Promise.resolve(); };
     video.pause = function () { N.pause(); state.paused = true; };
   }
@@ -56,6 +59,7 @@
     failed = null;
     try { N.stop(); } catch (e) { /* ignore */ }
     delete video.currentTime; delete video.duration; delete video.paused; delete video.play; delete video.pause;
+    delete video.lumenBuffered; delete video.lumenWaiting;
   }
 
   window.LumenPlatform = {
@@ -88,6 +92,8 @@
       act: function (path, done) { ask('act', path, function () { done(); }); },
       // the audio and subtitle tracks of what plays, and choosing one ("off": no subtitles)
       tracks: function (done) { ask('tracks', undefined, done); },
+      // what the controls show: {chapters: [ms], seekable, seekFrom/seekTo (ms: what can be jumped to), video, audio, text}
+      info: function (done) { if (N.info) ask('info', undefined, done); else done({}); },
       track: function (type, id) { N.track(type, id); },
       tracksClosed: function () { try { N.tracksClosed(); } catch (e) { /* an older app */ } },
       watch: function (cb) { window.__lumenDrivesChanged = cb; }

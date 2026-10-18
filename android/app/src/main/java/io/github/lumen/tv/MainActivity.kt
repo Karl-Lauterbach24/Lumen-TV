@@ -262,7 +262,7 @@ class MainActivity : Activity() {
             lastLogged = p.currentPosition / 5000
             android.util.Log.i("LumenTV", "position ${p.currentPosition} duration ${p.duration} seekable ${p.isCurrentMediaItemSeekable} state ${p.playbackState} playing ${p.isPlaying} buffered ${p.bufferedPosition} fifo ${FifoDataSource.total / 1000000.0} MB")
         }
-        js("window.__lumenEvent&&window.__lumenEvent('$name',${p.currentPosition},$dur,${if (p.isPlaying || (p.playWhenReady && p.playbackState == Player.STATE_BUFFERING)) "false" else "true"})")
+        js("window.__lumenEvent&&window.__lumenEvent('$name',${p.currentPosition},$dur,${if (p.isPlaying || (p.playWhenReady && p.playbackState == Player.STATE_BUFFERING)) "false" else "true"},${p.bufferedPosition},${p.playbackState == Player.STATE_BUFFERING})")
     }
 
     fun js(code: String) {
@@ -369,6 +369,7 @@ class MainActivity : Activity() {
         val path = uri.path.orEmpty().removePrefix("/")
         return try {
             if (uri.scheme == "disc" && path.endsWith(".m2ts", true)) {
+                chapters = clipChapters(uri.host ?: "", path.substringAfterLast('/').substringBeforeLast('.'))
                 val r = discs.reader(uri.host ?: "", path) ?: return null
                 val d = BdavSeek.duration(r, 192)
                 if (d > 0) ProportionalTsFactory(d, r.size / 192 * 188) else null
@@ -379,6 +380,56 @@ class MainActivity : Activity() {
                 if (d > 0) ProportionalTsFactory(d, r.size) else null
             } else null
         } catch (_: Exception) { null }
+    }
+
+    /** The chapters of what plays (seconds), for the controls. */
+    @Volatile private var chapters: List<Double> = emptyList()
+    /** The chapters of a disc's clips, from its playlists (key -> clip -> seconds of the clip). */
+    private val clipMarks = HashMap<String, Map<String, List<Double>>>()
+
+    private fun clipChapters(key: String, clip: String): List<Double> {
+        val all = synchronized(clipMarks) { clipMarks[key] } ?: run {
+            val out = HashMap<String, List<Double>>()
+            try {
+                val udf = discs.udf(key)
+                if (udf != null) for (e in udf.list("BDMV/PLAYLIST").filter { !it.dir && it.name.endsWith(".mpls", true) }) {
+                    val r = udf.open("BDMV/PLAYLIST/${e.name}")
+                    val b = ByteArray(r.size.toInt())
+                    var n = 0
+                    while (n < b.size) { val k = r.read(n.toLong(), b, n, b.size - n); if (k <= 0) break; n += k }
+                    // a clip in several playlists: the one with the most chapters for it
+                    Playlist.parse(e.name, b)?.clipMarks?.forEach { (c, m) -> if (m.size > (out[c]?.size ?: 1)) out[c] = m }
+                }
+            } catch (ex: Exception) { android.util.Log.i("LumenTV", "chapters: $ex") }
+            synchronized(clipMarks) { clipMarks[key] = out }
+            out
+        }
+        return all[clip].orEmpty()
+    }
+
+    private fun infoJson(): String {
+        val o = JSONObject()
+        val p = player ?: return o.toString()
+        o.put("chapters", org.json.JSONArray(chapters.map { (it * 1000).toLong() }))
+        o.put("seekable", p.isCurrentMediaItemSeekable && remoteBd == null && bd == null)
+        // MakeMKV's stream: only what the cache holds can be jumped to
+        val pipe = mkPipe
+        if (mkKey != null && pipe != null) pipe.cachedRangeMs()?.let { o.put("seekFrom", it.first).put("seekTo", it.second) }
+        p.videoFormat?.let { f ->
+            val h = if (f.height > 0) f.height else 0
+            val res = when { h >= 2000 -> "4K"; h >= 1000 -> "1080p"; h >= 700 -> "720p"; h > 0 -> "${h}p"; else -> "" }
+            val hdr = f.colorInfo?.colorTransfer.let { it == androidx.media3.common.C.COLOR_TRANSFER_ST2084 || it == androidx.media3.common.C.COLOR_TRANSFER_HLG }
+            val codec = when (f.sampleMimeType) { MimeTypes.VIDEO_H265 -> "HEVC"; MimeTypes.VIDEO_H264 -> "H.264"; MimeTypes.VIDEO_MPEG2 -> "MPEG-2"; MimeTypes.VIDEO_VC1 -> "VC-1"; MimeTypes.VIDEO_AV1 -> "AV1"; else -> "" }
+            o.put("video", listOf(res, if (hdr) "HDR" else "", codec).filter { it.isNotEmpty() }.joinToString(" · "))
+        }
+        try {
+            val tr = org.json.JSONArray(tracksJson())
+            for (i in 0 until tr.length()) {
+                val t = tr.getJSONObject(i)
+                if (t.optBoolean("selected") && !o.has(t.getString("type"))) o.put(t.getString("type"), t.getString("label"))
+            }
+        } catch (_: Exception) { }
+        return o.toString()
     }
 
     /** A disc with its menus (libbluray). Runs on a worker thread. */
@@ -470,7 +521,7 @@ class MainActivity : Activity() {
 
     private fun closePlayer() {
         closeBd()
-        remoteBd?.let { rb -> remoteBd = null; bdOverlay.visibility = View.GONE; bdBitmaps.fill(null); kotlin.concurrent.thread { rb.close() } }
+        remoteBd?.let { rb -> remoteBd = null; bdOverlay.visibility = View.GONE; bdBitmaps.fill(null); rb.close() }
         stopMakeMkv()
         main.removeCallbacks(tick)
         player?.let { it.stop(); it.clearMediaItems() }
@@ -722,7 +773,7 @@ class MainActivity : Activity() {
         mkLog("---- LibreDrive for $key")
         js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
         try {
-            val device = discs.lend(key) ?: run { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); return }
+            val device = mkLend(key) ?: run { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); return }
             if (!makemkv.openBridge(device) || !(makemkv.identify() || (makemkv.ejectAndReload() && makemkv.identify()))) {
                 say(t("Das Laufwerk antwortet nicht. Bitte aus- und wieder einschalten.", "The drive does not answer. Switch it off and on again.")); return
             }
@@ -755,6 +806,12 @@ class MainActivity : Activity() {
             .put("icon", "download").put("path", "disc:$key|#mkdump").put("dir", false).put("action", "mkdump"),
             JSONObject().put("name", "Menü ansehen (Test)").put("detail", "Experiment: das Bildmenü der Disc zeichnen lassen").put("icon", "screen").put("path", "disc:$key|#mkmenu").put("dir", false).put("action", "mkmenu"), JSONObject().put("name", t("Disc neu einlesen", "Read the disc again")).put("detail", t("Titel, Spuren, Folgen", "titles, tracks, episodes"))
             .put("icon", "refresh").put("path", "disc:$key|#mkreset").put("dir", false).put("action", "mkreset"))
+        // a drive that hangs: nothing of the disc is known, MakeMKV would hang with it
+        if (discs.noAnswer(key) && mkKey == null) {
+            if (rel.isEmpty()) note(t("Das Laufwerk antwortet nicht", "The drive does not answer"),
+                t("bitte das Laufwerk aus- und wieder einschalten (Netzteil), dann geht es weiter", "switch the drive off and on (its power supply), then it goes on"), "usb")
+            return out
+        }
         if (mkTitles[key] == null) makemkv.loadTitles(mkLabel(key))?.let { mkTitles[key] = it; kotlin.concurrent.thread { mkLookup(key, it) } }
         val titles = mkTitles[key]
         if (titles == null) {
@@ -897,7 +954,7 @@ class MainActivity : Activity() {
         if (mkKey != null) { say("MakeMKV is busy."); return }
         mkLabel(key)
         mkLog("---- menu probe of $key")
-        val device = discs.lend(key) ?: run { say("The drive is gone."); discs.giveBack(key); return }
+        val device = mkLend(key) ?: run { say("The drive is gone."); discs.giveBack(key); return }
         mkKey = key
         try {
             if (!makemkv.openBridge(device) || !(makemkv.identify() || (makemkv.ejectAndReload() && makemkv.identify()))) { say("The drive does not answer."); return }
@@ -942,7 +999,7 @@ class MainActivity : Activity() {
         mkMenuState = key
         js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
         mkLog("---- read the menu of $key")
-        val device = discs.lend(key)
+        val device = mkLend(key)
         mkKey = key
         try {
             if (device == null || !makemkv.openBridge(device) || !(makemkv.identify() || (makemkv.ejectAndReload() && makemkv.identify()))) { mkLog("menu: the drive does not answer"); return }
@@ -963,11 +1020,14 @@ class MainActivity : Activity() {
 
     /** The playlists' stream tables, read from the disc itself before MakeMKV has the drive (key -> playlist name -> table). */
     private val mkStn = HashMap<String, Map<String, StreamTable>>()
+    /** The playlists' chapters (key -> playlist name -> seconds), read with their stream tables. */
+    private val mkMarks = HashMap<String, Map<String, List<Double>>>()
 
     private fun mkReadPlaylists(key: String) {
         if (mkStn.containsKey(key)) return
         val udf = discs.udf(key) ?: return
         val out = HashMap<String, StreamTable>()
+        val marks = HashMap<String, List<Double>>()
         try {
             for (e in udf.list("BDMV/PLAYLIST").filter { !it.dir && it.name.endsWith(".mpls", true) }) {
                 val r = udf.open("BDMV/PLAYLIST/${e.name}")
@@ -975,12 +1035,14 @@ class MainActivity : Activity() {
                 var n = 0
                 while (n < b.size) { val k = r.read(n.toLong(), b, n, b.size - n); if (k <= 0) break; n += k }
                 val pl = Playlist.parse(e.name, b)
+                if (pl != null && pl.marks.size > 1) marks[e.name] = pl.marks
                 val st = StreamTable.parse(b) ?: continue
                 out[e.name] = st
                 if (pl != null && pl.seconds >= 900) mkLog("playlist ${e.name} ${(pl.seconds / 60).toInt()} min: $st")
             }
         } catch (ex: Exception) { mkLog("playlists: $ex") }
         mkStn[key] = out
+        mkMarks[key] = marks
     }
 
     /** Reads the disc's titles with MakeMKV (no playing): the page then lists the film or the episodes. */
@@ -991,7 +1053,7 @@ class MainActivity : Activity() {
         mkLog("---- read titles of $key")
         mkReadPlaylists(key)
         if (mkMenuWanted) { mkLog("the disc's menu is wanted: the titles are not read"); mkKey = null; return }
-        val device = discs.lend(key) ?: run { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); discs.giveBack(key); mkKey = null; return }
+        val device = mkLend(key) ?: run { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); discs.giveBack(key); mkKey = null; return }
         try {
             if (!makemkv.openBridge(device) || !(makemkv.identify() || (makemkv.ejectAndReload() && makemkv.identify()))) {
                 say(t("Das Laufwerk antwortet nicht. Bitte aus- und wieder einschalten.", "The drive does not answer. Switch it off and on again.")); return
@@ -1182,7 +1244,7 @@ class MainActivity : Activity() {
         mkLabel(key)
         mkLog("---- play the disc's menu $uri")
         if (makemkv.keyMode.isEmpty()) say(t("MakeMKV hat noch keinen Schlüssel (siehe Einstellungen).", "MakeMKV has no key yet (see the settings)."), 8000)
-        val device = discs.lend(key)
+        val device = mkLend(key)
         if (device == null) { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); discs.giveBack(key); return }
         mkKey = key
         try {
@@ -1283,8 +1345,9 @@ class MainActivity : Activity() {
         closed.await()
         mkLabel(key)
         mkLog("---- play $uri")
+        mkReadPlaylists(key)      // (the chapters and stream tables, read before MakeMKV has the drive)
         if (makemkv.keyMode.isEmpty()) tell(t("MakeMKV hat noch keinen Schlüssel: Beta-Schlüssel aus dem Forum wählen oder eigenen eingeben (in der Liste der Disc).", "MakeMKV has no key yet: choose the forum's beta key or enter your own (in the drive's list)."), 10000)
-        val device = discs.lend(key)
+        val device = mkLend(key)
         if (device == null) { tell(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); discs.giveBack(key); return }
         mkKey = key
         try {
@@ -1339,6 +1402,8 @@ class MainActivity : Activity() {
         tell(t("Wird gestartet (${t.durationMs / 60000} min, etwa eine Minute) …", "Starting (${t.durationMs / 60000} min, about a minute) …"), 60000)
         makemkv.clearCache()
         mkPlaying = t; mkPlayingLabel = mkLabel(key); picksFor = null
+        chapters = mkMarks[key]?.get(t.source).orEmpty()
+        mkLog("chapters: ${chapters.size}")
         val plan = makemkv.cachePlan()
         mkLog("cache: $plan (${plan.why})")
         // (no SIGSTOP: under proot it stopped makemkvcon's threads one by one and SIGCONT did not bring them all back;
@@ -1367,16 +1432,36 @@ class MainActivity : Activity() {
         return true
     }
 
+    /**
+     * Ends MakeMKV, then lets go of the drive – in this order: the bridge closed under a USB command still running leaves the
+     * drive hanging until it is switched off. On the main thread this goes on in the background; the next use of the drive
+     * waits for it ([mkLend]).
+     */
     private fun stopMakeMkv() {
         val key = mkKey ?: return
         mkKey = null
         mkWarm = null; mkWarmPlay = false; mkQuiet = false
         mkLog("---- stop (${mkPipe?.position?.let { "%.1f MB played".format(java.util.Locale.ROOT, it / 1e6) } ?: "nothing played"})")
-        makemkv.stop()
-        makemkv.driveSpeed(0)
-        mkPipe?.close(); mkPipe = null
-        makemkv.closeBridge()
-        discs.giveBack(key)
+        val pipe = mkPipe
+        mkPipe = null
+        val done = java.util.concurrent.CountDownLatch(1)
+        mkStopped = done
+        val work = {
+            try {
+                pipe?.close()                // (first: a held read lets go, so MakeMKV can end its command)
+                makemkv.stopAndWait()
+                makemkv.driveSpeed(0)
+                makemkv.closeBridge()
+                discs.giveBack(key)
+            } finally { done.countDown() }
+        }
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) kotlin.concurrent.thread { work() } else work()
+    }
+    @Volatile private var mkStopped: java.util.concurrent.CountDownLatch? = null
+    /** The drive for MakeMKV, once the run before has ended. */
+    private fun mkLend(key: String): android.hardware.usb.UsbDevice? {
+        mkStopped?.await(30, java.util.concurrent.TimeUnit.SECONDS)
+        return discs.lend(key)
     }
 
     // ---- keys: the page asks for them as the keyCodes of a TV browser ----
@@ -1492,6 +1577,7 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface fun play(url: String, hls: Boolean) {
+            chapters = emptyList()
             kotlin.concurrent.thread {
                 val u = Uri.parse(url)
                 if (u.scheme == "bdnav") { startBd(u); return@thread }
@@ -1534,6 +1620,8 @@ class MainActivity : Activity() {
                 reply(id, "[]")
             }
         }
+        /** What the controls show of what plays: its chapters, where it can be jumped to, and its picture and sound (see [infoJson]). */
+        @JavascriptInterface fun info(id: Int) { main.post { reply(id, infoJson()) } }
         /** The audio and subtitle tracks of what plays: [{type, id, label, selected, ok, forced}]. */
         @JavascriptInterface fun tracks(id: Int) { main.post { reply(id, tracksJson()) } }
         /** The track list was closed: the film goes on if it was held for it. */
