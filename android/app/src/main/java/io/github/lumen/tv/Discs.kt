@@ -59,6 +59,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             if (intent.action == UsbManager.ACTION_USB_DEVICE_DETACHED) {
                 val d: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                 synchronized(open) { open.remove(usbKey(d?.deviceName ?: ""))?.source?.close() }
+                onGone?.invoke(usbKey(d?.deviceName ?: ""))
             }
             changed()
         }
@@ -84,6 +85,8 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     /** Entries put before a drive's own (MakeMKV's), for the drive's first page. */
     /** The picture of a disc (a URL), where one is known: shown on the disc card and the disc page. */
     /** The name of an identified disc ("Doctor Who (2005) · Season 1 · Disc 3"), or "" . */
+    /** A drive was unplugged or switched off (its key). */
+    var onGone: ((key: String) -> Unit)? = null
     var nameFor: ((key: String) -> String)? = null
 
     var coverFor: ((key: String, label: String) -> String)? = null

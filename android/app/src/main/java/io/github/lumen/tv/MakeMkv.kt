@@ -79,7 +79,9 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
 
     /** A stream of a title, from MakeMKV's SINFO: [type] "audio" / "text" / "video", [lang] ISO 639-1 where known. */
     class Stream(val type: String, val lang: String, val langName: String, val codec: String, val channels: Int,
-                 val desc: String = "", val default: Boolean = false, val bitrate: String = "") {
+                 val desc: String = "", val default: Boolean = false, val bitrate: String = "", val size: String = "") {
+        /** The picture's height (a video stream whose size MakeMKV gave: "1920x1080"), else 0 */
+        val height get() = size.substringAfter('x', "").toIntOrNull() ?: 0
         /** (MakeMKV calls a forced subtitle track so in its description) */
         val forced get() = desc.contains("forced", true)
         val commentary get() = desc.contains("comment", true)
@@ -538,6 +540,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     fun setNoKey(label: String, v: Boolean) { prefs.edit().putBoolean("nokey:$label", v).apply() }
 
     private var lastIdentify = ""
+    private var lastSd = ""
 
     // the titles of a disc are kept (by its label) so that the disc is known at once the next time
     fun saveTitles(label: String, titles: List<Title>) {
@@ -546,7 +549,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         o.put("titles", org.json.JSONArray(titles.map { t ->
             org.json.JSONObject().put("id", t.id).put("name", t.name).put("ms", t.durationMs).put("size", t.size).put("file", t.file)
                 .put("ch", t.chapters).put("src", t.source).put("segs", org.json.JSONArray(t.segments))
-                .put("streams", org.json.JSONArray(t.streams.map { x -> org.json.JSONObject().put("t", x.type).put("l", x.lang).put("n", x.langName).put("c", x.codec).put("ch", x.channels).put("d", x.desc).put("df", x.default).put("b", x.bitrate) }))
+                .put("streams", org.json.JSONArray(t.streams.map { x -> org.json.JSONObject().put("t", x.type).put("l", x.lang).put("n", x.langName).put("c", x.codec).put("ch", x.channels).put("d", x.desc).put("df", x.default).put("b", x.bitrate).put("s", x.size) }))
         }))
         prefs.edit().putString("disc:$label", o.toString()).apply()
     }
@@ -569,7 +572,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         (0 until a.length()).map { i ->
             val t = a.getJSONObject(i)
             Title(t.getInt("id"), t.getString("name"), t.getLong("ms"), t.getString("size"), t.getString("file"), t.getInt("ch"),
-                t.getJSONArray("streams").let { sa -> (0 until sa.length()).map { j -> sa.getJSONObject(j).let { x -> Stream(x.getString("t"), x.getString("l"), x.getString("n"), x.getString("c"), x.getInt("ch"), x.optString("d"), x.optBoolean("df"), x.optString("b")) } } },
+                t.getJSONArray("streams").let { sa -> (0 until sa.length()).map { j -> sa.getJSONObject(j).let { x -> Stream(x.getString("t"), x.getString("l"), x.getString("n"), x.getString("c"), x.getInt("ch"), x.optString("d"), x.optBoolean("df"), x.optString("b"), x.optString("s")) } } },
                 t.getString("src"), t.getJSONArray("segs").let { ga -> (0 until ga.length()).map { ga.getInt(it) } })
         }
     } catch (_: Exception) { null }
@@ -590,7 +593,28 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         // the name without season / disc markers: "Doctor Who - Staffel 1 - Disc 3" -> "Doctor Who"
         val name = raw.replace(Regex("""(?i)[-–\s]*(?:\bST|\bS|season|staffel|series|\bBD|\bdisc|\bdisk)\s*0*\d{1,2}\b.*$"""), "").trim(' ', '-', '–')
             .split(' ').joinToString(" ") { w -> if (w.length >= 3 && w == w.uppercase()) w.lowercase().replaceFirstChar { it.uppercase() } else w }
-        val real = titles.filter { it.minutes >= 1 }
+        val all0 = titles.filter { it.minutes >= 1 }
+        // a Blu-ray's bonus material is often in standard definition (576p, 480p): with titles in HD on the disc, those are
+        // never the film or an episode. The picture's size where MakeMKV gave it, else the data per minute (titles kept
+        // from before): below ~6.5 Mbit/s and less than half of the disc's richest title.
+        fun bytes(t: Title): Double {
+            val m = Regex("""([\d.]+)\s*([KMG])B""").find(t.size) ?: return 0.0
+            return (m.groupValues[1].toDoubleOrNull() ?: 0.0) * when (m.groupValues[2]) { "G" -> 1e9; "M" -> 1e6; else -> 1e3 }
+        }
+        fun perMinute(t: Title) = bytes(t) / maxOf(1, t.minutes)
+        val richest = all0.maxOfOrNull { perMinute(it) } ?: 0.0
+        fun standardDef(t: Title): Boolean {
+            val h = t.streams.firstOrNull { it.type == "video" }?.height ?: 0
+            if (h > 0) return h < 700
+            val r = perMinute(t)
+            return r in 1.0..50e6 && richest > r * 2.2
+        }
+        val sd = all0.filter { standardDef(it) }
+        val real = if (sd.isNotEmpty() && sd.size < all0.size) all0 - sd.toSet() else all0
+        if (sd.isNotEmpty() && real !== all0) {
+            val msg = "identify: standard definition, as extras: " + sd.joinToString(" | ") { "#${it.id} ${it.minutes} min ${it.size}" }
+            if (msg != lastSd) { lastSd = msg; log(msg) }
+        }
         val eps = real.filter { it.minutes in 15..75 }
         var group: List<Title> = emptyList()
         if (eps.size >= 2) {
@@ -611,13 +635,16 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
             val pos = { t: Title -> val f = t.segments.firstOrNull(); if (all != null && f != null) all.segments.indexOf(f).takeIf { it >= 0 } else null }
             if (group.all { pos(it) != null }) group = group.sortedBy { pos(it) }
             else if (group.all { it.source.isNotEmpty() }) group = group.sortedWith(compareBy({ it.source }, { it.id }))
-            val extras = real.filter { it !in group && it != all && it.minutes >= 2 }.sortedByDescending { it.durationMs }
+            val extras = all0.filter { it !in group && it != all && it.minutes >= 2 }.sortedByDescending { it.durationMs }
             val msg = "identify: episodes " + group.joinToString(" | ") { "#${it.id} ${it.source} segs ${it.segments}" } + (all?.let { " ; all #${it.id} segs ${it.segments}" } ?: " ; no play-all")
             if (msg != lastIdentify) { lastIdentify = msg; log(msg) }
             return Disc(name, "episodes", season, discNo, group, all, extras)
         }
         val film = real.maxByOrNull { it.durationMs }
-        val extras = real.filter { it != film && it.minutes >= 2 }.sortedByDescending { it.durationMs }
+        val extras = all0.filter { it != film && it.minutes >= 2 }.sortedByDescending { it.durationMs }
+        // a disc of a series (its name says the season) with one episode-long title: that one episode, named by the guide
+        if (season > 0 && film != null && film.minutes in 15..75)
+            return Disc(name, "episodes", season, discNo, listOf(film), null, extras)
         return Disc(name, "movie", season, discNo, listOfNotNull(film), null, extras)
     }
 
@@ -666,7 +693,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
                     val type = when (v[1]) { "Audio" -> "audio"; "Subtitles" -> "text"; "Video" -> "video"; else -> v[1].orEmpty().lowercase() }
                     val code = v[3].orEmpty()
                     Stream(type, if (code.isEmpty()) "" else androidx.media3.common.util.Util.normalizeLanguageCode(code) ?: code,
-                        v[4].orEmpty(), v[6] ?: v[7].orEmpty(), v[14]?.toIntOrNull() ?: 0, v[30].orEmpty(), v[38] == "d", v[13].orEmpty())
+                        v[4].orEmpty(), v[6] ?: v[7].orEmpty(), v[14]?.toIntOrNull() ?: 0, v[30].orEmpty(), v[38] == "d", v[13].orEmpty(), v[19].orEmpty())
                 }.orEmpty(), a[16].orEmpty(), a[26].orEmpty().split(',').mapNotNull { it.trim().toIntOrNull() })
         }
     }

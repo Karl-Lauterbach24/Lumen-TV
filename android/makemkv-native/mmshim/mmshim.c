@@ -193,6 +193,12 @@ static int bot_locked(const uint8_t *cdb, int cdb_len, int dir_in, uint8_t *data
     cbw[14] = cdb_len;
     memcpy(cbw + 15, cdb, cdb_len > 16 ? 16 : cdb_len);
     if (bulk(ep_out, cbw, 31, 5000) != 31) {
+        /* the drive is gone (unplugged, switched off): nothing of it can hang any more, and a reader such as libbluray
+           would ask again and again for ever – the process ends */
+        if (errno == ENODEV) {
+            LOG("the drive is gone (%s): the process ends", strerror(errno));
+            _exit(75);
+        }
         LOG("CBW failed: %s", strerror(errno));
         reset_recovery();
         return -1;

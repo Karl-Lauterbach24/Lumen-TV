@@ -82,6 +82,15 @@ class MainActivity : Activity() {
             "MakeMKV ${if (makemkv.available) "available (${makemkv.abi})" else "not available on this device"}, key: ${makemkv.keyMode.ifEmpty { "none" }}")
         makemkv.refreshBetaKeyIfDue()
         makemkv.onVersion = { updates.makemkvInstalled = it }
+        // the drive MakeMKV reads is gone (unplugged, switched off): what plays from it ends, MakeMKV with it
+        discs.onGone = { key ->
+            if (key == mkKey) {
+                mkLog("the drive $key is gone: playback ends")
+                if (player != null) js("window.__lumenEvent&&window.__lumenEvent('error',0,0,true)")
+                closePlayer()
+                say(t("Das Laufwerk wurde getrennt.", "The drive was disconnected."), 8000)
+            }
+        }
         makemkv.onKeyDownload = { on ->
             if (on) js("window.lumenToast&&window.lumenToast(${JSONObject.quote(t("MakeMKV lädt seine Schlüsseldatenbank (für 4K-Discs, einige Minuten) …", "MakeMKV is downloading its key database (for 4K discs, a few minutes) …"))},600000,-1)")
             else say("", 1)
@@ -152,10 +161,12 @@ class MainActivity : Activity() {
         }.setEnableDecoderFallback(true)
             .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
         // a short look-ahead: the menu of a disc runs ahead of the picture by what the player has buffered;
-        // MakeMKV's stream comes in bursts: a longer one, but held to 32 MB (MakeMKV needs the memory of a small television)
+        // MakeMKV's stream: 10–30 s ahead, held to 40 MB (MakeMKV needs the memory of a small television). 12 MB were only
+        // about 2 s in a scene of high bit rate (1080p, DTS-HD MA): the player ran dry every few seconds for a moment while
+        // the cache on the storage had 100 MB ready
         val load = androidx.media3.exoplayer.DefaultLoadControl.Builder()
             .apply {
-                if (long) setBufferDurationsMs(6000, 15000, 2500, 4000).setTargetBufferBytes(12 shl 20).setPrioritizeTimeOverSizeThresholds(false)
+                if (long) setBufferDurationsMs(10000, 30000, 2500, 5000).setTargetBufferBytes(40 shl 20).setPrioritizeTimeOverSizeThresholds(false)
                 else setBufferDurationsMs(2000, 4000, 800, 1500).setPrioritizeTimeOverSizeThresholds(true)   // (a disc stream runs seconds ahead in the picture: size must not stop the loading while the sound is still missing)
             }.build()
         val p = ExoPlayer.Builder(this, factory).setLoadControl(load).build()
@@ -410,7 +421,10 @@ class MainActivity : Activity() {
     private fun infoJson(): String {
         val o = JSONObject()
         val p = player ?: return o.toString()
-        o.put("chapters", org.json.JSONArray(chapters.map { (it * 1000).toLong() }))
+        // MakeMKV: the chapters of the playlist it streams (also after a quick start, which was prepared before the key)
+        val key = mkKey
+        val shown = mkPlaying?.let { t -> key?.let { k -> mkMarks[k]?.get(t.source) } } ?: chapters
+        o.put("chapters", org.json.JSONArray(shown.map { (it * 1000).toLong() }))
         o.put("seekable", p.isCurrentMediaItemSeekable && remoteBd == null && bd == null)
         // MakeMKV's stream: only what the cache holds can be jumped to
         val pipe = mkPipe
@@ -860,7 +874,7 @@ class MainActivity : Activity() {
         // the title most likely wanted is prepared while the page is looked at (see warmMakeMkv)
         if (makemkv.quickStart) d.main.firstOrNull()?.let { warmMakeMkv(Uri.parse("makemkv://$key/${it.id}")) }
         out.add(JSONObject().put("name", mkDiscName(key).ifEmpty { t("Unbekannte Disc", "Unknown disc") })
-            .put("detail", if (d.kind == "episodes") t("${d.main.size} Episoden", "${d.main.size} episodes") else "Film · ${d.main.firstOrNull()?.minutes ?: 0} min")
+            .put("detail", if (d.kind == "episodes") (if (d.main.size == 1) t("1 Episode", "1 episode") else t("${d.main.size} Episoden", "${d.main.size} episodes")) else "Film · ${d.main.firstOrNull()?.minutes ?: 0} min")
             .put("icon", if (d.kind == "episodes") "episodes" else "film").put("path", "").put("dir", false).put("off", true))
         // the episodes follow one another (the page goes on to the next when one ends); the rest stands alone
         group = "episodes"
@@ -1402,8 +1416,7 @@ class MainActivity : Activity() {
         tell(t("Wird gestartet (${t.durationMs / 60000} min, etwa eine Minute) …", "Starting (${t.durationMs / 60000} min, about a minute) …"), 60000)
         makemkv.clearCache()
         mkPlaying = t; mkPlayingLabel = mkLabel(key); picksFor = null
-        chapters = mkMarks[key]?.get(t.source).orEmpty()
-        mkLog("chapters: ${chapters.size}")
+        mkLog("chapters: ${mkMarks[key]?.get(t.source)?.size ?: 0}")
         val plan = makemkv.cachePlan()
         mkLog("cache: $plan (${plan.why})")
         // (no SIGSTOP: under proot it stopped makemkvcon's threads one by one and SIGCONT did not bring them all back;
@@ -1453,16 +1466,27 @@ class MainActivity : Activity() {
                 makemkv.driveSpeed(0)
                 makemkv.closeBridge()
                 discs.giveBack(key)
-            } finally { done.countDown() }
+            } finally { mkFree(); done.countDown() }
         }
         if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) kotlin.concurrent.thread { work() } else work()
     }
     @Volatile private var mkStopped: java.util.concurrent.CountDownLatch? = null
-    /** The drive for MakeMKV, once the run before has ended. */
+    /**
+     * The drive for one MakeMKV run (a title, the titles, the menu, LibreDrive), once the run before has ended: one run at a
+     * time. Two at once (a quick start and the menu reader, started in the same moment) opened the one USB bridge twice and
+     * closed it under each other – the drive hung soon after. Given back by [stopMakeMkv].
+     */
+    private val mkDrive = java.util.concurrent.Semaphore(1)
+    private val mkDriveHeld = java.util.concurrent.atomic.AtomicBoolean(false)
     private fun mkLend(key: String): android.hardware.usb.UsbDevice? {
         mkStopped?.await(30, java.util.concurrent.TimeUnit.SECONDS)
-        return discs.lend(key)
+        if (mkDrive.tryAcquire(90, java.util.concurrent.TimeUnit.SECONDS)) mkDriveHeld.set(true)
+        else mkLog("drive: another MakeMKV run still has it after 90 s")
+        val d = discs.lend(key)
+        if (d == null) mkFree()
+        return d
     }
+    private fun mkFree() { if (mkDriveHeld.compareAndSet(true, false)) mkDrive.release() }
 
     // ---- keys: the page asks for them as the keyCodes of a TV browser ----
     private fun pageKey(code: Int) {
