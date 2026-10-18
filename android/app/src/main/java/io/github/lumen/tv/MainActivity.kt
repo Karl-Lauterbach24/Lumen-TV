@@ -664,7 +664,9 @@ class MainActivity : Activity() {
         } catch (_: Exception) { }
     }
 
-    private fun say(msg: String, ms: Int = 7000) = js("window.lumenToast&&window.lumenToast(${JSONObject.quote(msg)},$ms)")
+    /** A message on the page; long waits (60 s and more) get a running bar: something is happening. */
+    private fun say(msg: String, ms: Int = 7000) =
+        js("window.lumenToast&&window.lumenToast(${JSONObject.quote(msg)},$ms${if (ms >= 60000 && msg.endsWith("…")) ",-1" else ""})")
     private fun t(de: String, en: String) = if (java.util.Locale.getDefault().language == "de") de else en
 
     private fun langName(code: String): String =

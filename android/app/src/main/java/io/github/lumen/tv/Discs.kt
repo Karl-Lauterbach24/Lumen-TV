@@ -35,6 +35,8 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
         @Volatile var lastLook = System.currentTimeMillis()
         /** AACS bus encryption: the disc asks for it / the drive can do it (null: not known) */
         var busDisc: Boolean? = null
+        /** An audio CD's tracks (the lead-out last). */
+        var cdTracks: List<UsbBlockSource.CdTrack>? = null
         /** An Ultra HD Blu-ray (index.bdmv of version 0300): AACS 2, the drive encrypts what it reads unless LibreDrive is on. */
         var uhd = false
         var busDrive: Boolean? = null
@@ -98,6 +100,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     private fun busBlocked(d: Disc): Boolean = d.encrypted && d.busDisc == true && d.busDrive != false && d.busKey == null && d.key !in libreReady
 
     fun needsMakeMkv(key: String): Boolean = synchronized(open) { open[key] }?.let {
+        (it.kind == "HD DVD" && it.encrypted) ||
         it.kind == "Blu-ray" && it.encrypted && (it.keys == null || (!it.uhd && busBlocked(it)) || (it.uhd && it.key !in uhdTry))
     } ?: false
 
@@ -138,6 +141,13 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     fun reader(key: String, path: String): RandomReader? {
         if (needsLibreDrive(key)) return null
         val d = synchronized(open) { open[key] } ?: return null
+        d.cdTracks?.let { toc ->
+            val n = Regex("CDDA/track(\\d+)\\.wav").find(path)?.groupValues?.get(1)?.toIntOrNull() ?: return null
+            val i = toc.indexOfFirst { it.number == n }
+            if (i < 0 || i + 1 >= toc.size) return null
+            val src = d.source as? UsbBlockSource ?: return null
+            return CddaReader(src, toc[i].start, toc[i + 1].start - toc[i].start)
+        }
         if (uhdBlocked(d) && path.startsWith("BDMV/STREAM/", true)) return null
         if (d.encrypted) { ensureBus(d); if (busBlocked(d) && path.startsWith("BDMV/STREAM/", true)) return null }
         val r = d.udf?.open(path) ?: return null
@@ -378,6 +388,13 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             if (!src.inquire()) { src.close(); return null }                // a USB stick or disk: the system handles those
             val label = (src.vendor + " " + src.product).trim().ifEmpty { name }
             if (!src.waitReady()) return Disc(key, label, "", null, src, false, "empty")
+            // an audio CD: no file system, its tracks from the table of contents
+            src.readToc()?.let { toc ->
+                if (toc.first().audio) {
+                    src.setSpeed(4 * 176)
+                    return Disc(key, "Audio-CD", "Audio-CD", null, src, false, "").also { it.cdTracks = toc }
+                }
+            }
             if (!src.readCapacity()) return Disc(key, label, "", null, src, false, "unreadable")
             return describe(key, label, Udf(src), src)
         } catch (e: Exception) {
@@ -399,7 +416,9 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     private fun describe(key: String, fallbackLabel: String, udf: Udf, src: BlockSource?): Disc {
         val bd = udf.exists("BDMV/index.bdmv")
         val dvd = udf.exists("VIDEO_TS/VIDEO_TS.IFO")
-        val kind = if (bd) "Blu-ray" else if (dvd) "DVD-Video" else ""
+        // (an HD DVD: EVO files in HVDVD_TS, AACS like a Blu-ray – MakeMKV reads it, where the drive can; the ASUS tested cannot)
+        val hddvd = !bd && udf.exists("HVDVD_TS")
+        val kind = if (bd) "Blu-ray" else if (hddvd) "HD DVD" else if (dvd) "DVD-Video" else ""
         val label = udf.label.ifEmpty { fallbackLabel }
         val encrypted = udf.exists("AACS") || udf.exists("BDMV/AACS")
         val d = Disc(key, label, kind, udf, src, encrypted, "")
@@ -484,6 +503,18 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             out.put(JSONObject().put("name", t("Titel auf den Speicher kopieren", "Copy the titles to storage")).put("path", "disc:$key|#copy").put("dir", false).put("action", "copy").put("icon", "download"))
             out.put(JSONObject().put("name", t("MKV-Dateien der Titel erstellen", "Make MKV files of the titles")).put("path", "disc:$key|#rip").put("dir", false).put("action", "rip").put("icon", "film"))
             if (d.encrypted) out.put(JSONObject().put("name", t("Schutz dieser Disc (AACS)", "Protection of this disc (AACS)")).put("path", "disc:$key|#info").put("dir", false).put("action", "info").put("icon", "info"))
+            return out
+        }
+        if (rel.isEmpty() && d.kind == "Audio-CD") {
+            val toc = d.cdTracks.orEmpty()
+            for (i in 0 until toc.size - 1) {
+                val t = toc[i]
+                if (!t.audio) continue
+                val secs = (toc[i + 1].start - t.start) / 75
+                out.put(JSONObject().put("name", t("Titel ", "Track ") + t.number).put("detail", "%d:%02d".format(secs / 60, secs % 60))
+                    .put("path", "disc:$key|CDDA/track%02d.wav".format(t.number)).put("dir", false)
+                    .put("uri", base + "CDDA/track%02d.wav".format(t.number)).put("video", true).put("icon", "music").put("group", "cd"))
+            }
             return out
         }
         if (rel.isEmpty() && d.kind == "DVD-Video") {
@@ -633,4 +664,34 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     }
 
     fun copiedFolder(): File = File(activity.getExternalFilesDir(Environment.DIRECTORY_MOVIES), "")
+}
+
+/** One track of an audio CD as a WAV file: a header, then the track's samples as the drive reads them (READ CD). */
+class CddaReader(private val src: UsbBlockSource, private val start: Long, private val sectors: Long) : RandomReader {
+    private val header = java.nio.ByteBuffer.allocate(44).order(java.nio.ByteOrder.LITTLE_ENDIAN).apply {
+        val data = (sectors * 2352).toInt()
+        put("RIFF".toByteArray()); putInt(36 + data); put("WAVE".toByteArray())
+        put("fmt ".toByteArray()); putInt(16); putShort(1); putShort(2); putInt(44100); putInt(176400); putShort(4); putShort(16)
+        put("data".toByteArray()); putInt(data)
+    }.array()
+    override val size: Long = 44 + sectors * 2352
+    private val chunk = ByteArray(2352 * 27)
+    private var chunkAt = -1L
+    private var chunkLen = 0
+
+    @Synchronized override fun read(pos: Long, buf: ByteArray, off: Int, len: Int): Int {
+        if (pos >= size) return -1
+        if (pos < 44) { val n = minOf(len.toLong(), 44 - pos).toInt(); System.arraycopy(header, pos.toInt(), buf, off, n); return n }
+        val d = pos - 44
+        val sector = d / 2352
+        if (chunkAt < 0 || sector < chunkAt || sector >= chunkAt + chunkLen) {
+            val n = minOf(27L, sectors - sector).toInt()
+            src.readCd(start + sector, n, chunk, 0)
+            chunkAt = sector; chunkLen = n
+        }
+        val inChunk = (d - chunkAt * 2352).toInt()
+        val n = minOf(len, chunkLen * 2352 - inChunk)
+        System.arraycopy(chunk, inChunk, buf, off, n)
+        return n
+    }
 }

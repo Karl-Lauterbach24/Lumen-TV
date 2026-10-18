@@ -241,6 +241,40 @@ class UsbBlockSource private constructor(
         return false
     }
 
+    // ---- audio CDs ----
+    class CdTrack(val number: Int, val start: Long, val audio: Boolean)
+
+    /** The CD's table of contents (READ TOC, LBA form), the lead-out (0xAA) last; null for a disc without one. */
+    fun readToc(): List<CdTrack>? {
+        val b = ByteArray(804)
+        val st = try { command(cdb(0x43, 0, 0, 0, 0, 0, 0, 0x03, 0x24, 0), b, 0, 804, 10000) } catch (_: IOException) { return null }
+        if (st != 0) return null
+        val len = (((b[0].toInt() and 0xff) shl 8) or (b[1].toInt() and 0xff)) + 2
+        val out = ArrayList<CdTrack>()
+        var o = 4
+        while (o + 8 <= minOf(len, b.size)) {
+            val control = b[o + 1].toInt() and 0x0f
+            out.add(CdTrack(b[o + 2].toInt() and 0xff, getBe32(b, o + 4), control and 0x04 == 0))
+            o += 8
+        }
+        return out.takeIf { it.size >= 2 }
+    }
+
+    /** [count] sectors of CD audio (2352 bytes each) from [lba] (READ CD). */
+    fun readCd(lba: Long, count: Int, out: ByteArray, offset: Int) {
+        val c = ByteArray(12)
+        c[0] = 0xBE.toByte(); c[1] = 0x04                     // expected sector type: CD-DA
+        c[2] = (lba shr 24).toByte(); c[3] = (lba shr 16).toByte(); c[4] = (lba shr 8).toByte(); c[5] = lba.toByte()
+        c[6] = (count shr 16).toByte(); c[7] = (count shr 8).toByte(); c[8] = count.toByte()
+        c[9] = 0x10                                            // user data
+        if (command(c, out, offset, count * 2352, 20000) != 0) throw IOException("READ CD failed at $lba")
+    }
+
+    /** The read speed in KB/s (0xFFFF: as fast as it can); a CD plays at 176 KB/s, so 4× is quiet and enough. */
+    fun setSpeed(kbs: Int) {
+        try { command(cdb(0xBB, 0, kbs shr 8, kbs and 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0), null, 0, 0, 10000) } catch (_: IOException) { }
+    }
+
     fun readCapacity(): Boolean {
         val b = ByteArray(8)
         if (command(cdb(0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0), b, 0, 8, 10000) != 0) return false
