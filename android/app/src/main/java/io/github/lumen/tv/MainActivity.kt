@@ -1482,6 +1482,14 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface fun exit() { main.post { finish() } }
+        /** The page on top: a title prepared for a quick start is let go when its disc's page is left (the drive goes quiet). */
+        @JavascriptInterface fun pageShown(what: String) {
+            val w = mkWarm ?: return
+            if (what.startsWith("disc:${w.host}")) return
+            if (player?.isPlaying == true || mkPipe?.position?.let { it > 0 } == true) return
+            mkLog("quick start: the page of the disc was left, $w is let go")
+            kotlin.concurrent.thread { if (mkWarm == w) stopMakeMkv() }
+        }
 
         @JavascriptInterface fun play(url: String, hls: Boolean) {
             kotlin.concurrent.thread {

@@ -66,6 +66,7 @@
     init: function () { document.documentElement.className = 'native'; },
     localIp: function (done) { done(String(N.localIp() || '')); },
     exit: function () { N.exit(); },
+    pageShown: function (what) { if (N.pageShown) N.pageShown(String(what)); },
 
     // the stream Lumen casts: HLS, played by the native player
     attach: function (video, cmd, onFail) {
