@@ -82,6 +82,10 @@ class MainActivity : Activity() {
             "MakeMKV ${if (makemkv.available) "available (${makemkv.abi})" else "not available on this device"}, key: ${makemkv.keyMode.ifEmpty { "none" }}")
         makemkv.refreshBetaKeyIfDue()
         makemkv.onVersion = { updates.makemkvInstalled = it }
+        makemkv.onKeyDownload = { on ->
+            if (on) js("window.lumenToast&&window.lumenToast(${JSONObject.quote(t("MakeMKV lädt seine Schlüsseldatenbank (für 4K-Discs, einige Minuten) …", "MakeMKV is downloading its key database (for 4K discs, a few minutes) …"))},600000,-1)")
+            else say("", 1)
+        }
         kotlin.concurrent.thread(isDaemon = true) {
             if (updates.due()) updates.check()
             announceUpdates()
@@ -894,6 +898,9 @@ class MainActivity : Activity() {
     /** Reads the menu of the disc [key] (once per disc, remembered): runs on a worker thread, gives up when a film is to be played. */
     private fun mkMenuRead(key: String) {
         if (mkMenuState.isNotEmpty() || mkKey != null || mkMenuNamesOf(key) != null || makemkv.menuTried(mkLabel(key))) return
+        // a disc with a Java menu (BD-J): bdmenu cannot run it, there is nothing to read
+        val bdj = try { discs.udf(key)?.list("BDMV/JAR")?.isNotEmpty() == true } catch (_: Exception) { false }
+        if (bdj) { mkLog("menu: a Java menu (BD-J), not read"); makemkv.setMenuTried(mkLabel(key)); return }
         mkMenuState = key
         js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
         mkLog("---- read the menu of $key")
@@ -908,8 +915,9 @@ class MainActivity : Activity() {
         } catch (e: Throwable) {
             mkLog("menu: failed: ${android.util.Log.getStackTraceString(e)}")
         } finally {
-            mkMenuState = ""
+            // (MakeMKV stopped first, then the state cleared: a film waiting for the drive starts only after this)
             stopMakeMkv()
+            mkMenuState = ""
             js("window.__lumenDrivesChanged&&window.__lumenDrivesChanged()")
         }
     }
@@ -951,7 +959,19 @@ class MainActivity : Activity() {
                 say(t("Das Laufwerk antwortet nicht. Bitte aus- und wieder einschalten.", "The drive does not answer. Switch it off and on again.")); return
             }
             say(if (java.util.Locale.getDefault().language == "de") "MakeMKV liest die Disc …" else "MakeMKV reads the disc …")
-            val titles = makemkv.titles()
+            var titles = makemkv.titles()
+            // the drive answered reads with timeouts: the disc out and in once and read again; then it is the user's turn
+            if (makemkv.driveStuck && mkKey == key) {
+                mkLog("drive stuck while reading the titles: eject and reload")
+                say(t("Das Laufwerk kommt mit der Disc nicht weiter: sie wird aus- und wieder eingezogen …", "The drive cannot go on with the disc: it is ejected and loaded again …"), 90000)
+                if (makemkv.ejectAndReload() && makemkv.identify()) titles = makemkv.titles()
+                if (makemkv.driveStuck) {
+                    mkLog("drive still stuck: the user is asked")
+                    say(t("Das Laufwerk kann die Disc nicht lesen. Bitte die Disc herausnehmen, prüfen (Kratzer, Staub) und wieder einlegen; hilft das nicht, das Laufwerk aus- und einschalten.",
+                        "The drive cannot read the disc. Take it out, check it (scratches, dust) and put it in again; if that does not help, switch the drive off and on."), 30000)
+                    return
+                }
+            }
             mkLog("titles: " + titles.joinToString(" | "))
             if (titles.isNotEmpty()) { mkTitles[key] = titles; makemkv.saveTitles(mkLabel(key), titles) }
             else if (makemkv.keyUnknown) {

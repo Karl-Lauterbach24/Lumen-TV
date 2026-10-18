@@ -40,6 +40,32 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         var READ_BUFFER_MB = 16
         @Volatile private var bridgeOwner: MakeMkv? = null
         private var bridgeServer: Thread? = null
+
+        /**
+         * Ends a run of proot: first the programs in it (makemkvcon, bdmenu) with SIGTERM, which the drive shim holds until the
+         * command in flight is done – killed between a command and its status, the drive's USB bridge hangs until it is switched
+         * off –, then proot itself. Blocks up to about 12 seconds.
+         */
+        fun stopGently(p: Process) {
+            val root = try { p.javaClass.getDeclaredField("pid").apply { isAccessible = true }.getInt(p) } catch (_: Exception) { -1 }
+            if (root > 0) {
+                val kids = ArrayList<Int>()
+                // (the processes under proot: children of children, of this app's user)
+                fun childrenOf(pp: Int) = java.io.File("/proc").listFiles()?.mapNotNull { f ->
+                    val pid = f.name.toIntOrNull() ?: return@mapNotNull null
+                    val stat = try { java.io.File(f, "stat").readText() } catch (_: Exception) { return@mapNotNull null }
+                    val ppid = stat.substringAfterLast(')').trim().split(' ').getOrNull(1)?.toIntOrNull()
+                    if (ppid == pp) pid else null
+                }.orEmpty()
+                val todo = ArrayDeque(listOf(root))
+                while (todo.isNotEmpty()) { val q = todo.removeFirst(); for (c in childrenOf(q)) { kids.add(c); todo.add(c) } }
+                for (k in kids) try { android.os.Process.sendSignal(k, 15) } catch (_: Exception) { }
+                val until = System.currentTimeMillis() + 10_000
+                while (System.currentTimeMillis() < until && kids.any { java.io.File("/proc/$it").exists() }) Thread.sleep(100)
+            }
+            p.destroy()
+            try { p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) { }
+        }
     }
 
     /** A stream of a title, from MakeMKV's SINFO: [type] "audio" / "text" / "video", [lang] ISO 639-1 where known. */
@@ -415,7 +441,7 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
      * True when the drive is ready again afterwards.
      */
     fun ejectAndReload(): Boolean {
-        proc?.let { it.destroy(); it.waitFor(10, java.util.concurrent.TimeUnit.SECONDS) }
+        proc?.let { stopGently(it) }
         proc = null
         Thread.sleep(500)
         log("drive: unlocking the tray: " + scsi(byteArrayOf(0x1e, 0, 0, 0, 0, 0)).first)
@@ -446,22 +472,27 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     /** Called (on makemkvcon's output thread) when the drive got stuck. */
     var onStuck: (() -> Unit)? = null
     var onVersion: ((String) -> Unit)? = null
+    /** MakeMKV downloads its key database (true) or has gone on with something else (false). */
+    var onKeyDownload: ((Boolean) -> Unit)? = null
 
     private fun pipeOutput(p: Process, onLine: (String) -> Unit = {}) {
         var prg = 0
         var timeouts = 0
         driveStuck = false
         keyUnknown = false
+        var downloading = false
         // (stopping makemkvcon interrupts the read: that ends the output, it is no error)
         try {
             p.inputStream.bufferedReader().forEachLine { l ->
                 onLine(l)
                 if (l.startsWith("MSG:1005")) Regex("MakeMKV v(\\d+\\.\\d+\\.\\d+)").find(l)?.let { onVersion?.invoke(it.groupValues[1]) }
-                if (l.startsWith("MSG:3303")) keyUnknown = true       // "The volume key is unknown for this disc"
+                if (l.startsWith("MSG:3303")) keyUnknown = true
+                if (l.startsWith("MSG:3338")) { downloading = true; onKeyDownload?.invoke(true) }
+                else if (downloading && (l.startsWith("MSG:") || l.startsWith("TCOUNT") || l.startsWith("TINFO"))) { downloading = false; onKeyDownload?.invoke(false) }       // "The volume key is unknown for this disc"
                 if (l.startsWith("MSG:2003") && l.contains("TIMEOUT ON LOGICAL UNIT") && ++timeouts == 3) {
                     log("drive: 3 read timeouts: makemkvcon is stopped")
                     driveStuck = true
-                    p.destroy()
+                    kotlin.concurrent.thread { stopGently(p) }
                     onStuck?.invoke()
                 }
                 when {
@@ -691,8 +722,9 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
     fun menuDir(): File = File(root, "tmp/menu")
 
     fun stop() {
-        proc?.destroy(); proc = null
+        proc?.let { p -> kotlin.concurrent.thread { stopGently(p) } }; proc = null
     }
+
 
 }
 
@@ -938,10 +970,24 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
  */
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 class LiveMatroska(private val delegate: androidx.media3.extractor.Extractor, private val pipe: PipeStream) : androidx.media3.extractor.Extractor {
+    private val dolbyVisionDecoder = try {
+        android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS).codecInfos.any { c ->
+            !c.isEncoder && c.supportedTypes.any { it.equals(androidx.media3.common.MimeTypes.VIDEO_DOLBY_VISION, true) } }
+    } catch (_: Exception) { false }
     override fun sniff(input: androidx.media3.extractor.ExtractorInput) = delegate.sniff(input)
     override fun init(output: androidx.media3.extractor.ExtractorOutput) {
         delegate.init(object : androidx.media3.extractor.ExtractorOutput {
-            override fun track(id: Int, type: Int) = output.track(id, type)
+            override fun track(id: Int, type: Int): androidx.media3.extractor.TrackOutput {
+                val t = output.track(id, type)
+                // a 4K disc's Dolby Vision (profile 7: an HEVC base layer with HDR10, plus an enhancement): a television without a
+                // Dolby Vision decoder plays the base layer – as HEVC, which Media3 does not choose by itself for profile 7
+                return if (dolbyVisionDecoder) t else object : androidx.media3.extractor.TrackOutput by t {
+                    override fun format(format: androidx.media3.common.Format) {
+                        t.format(if (format.sampleMimeType == androidx.media3.common.MimeTypes.VIDEO_DOLBY_VISION)
+                            format.buildUpon().setSampleMimeType(androidx.media3.common.MimeTypes.VIDEO_H265).setCodecs(null).build() else format)
+                    }
+                }
+            }
             override fun endTracks() = output.endTracks()
             override fun seekMap(map: androidx.media3.extractor.SeekMap) {
                 output.seekMap(object : androidx.media3.extractor.SeekMap {

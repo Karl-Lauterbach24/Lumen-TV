@@ -31,6 +31,7 @@
 #include <linux/usbdevice_fs.h>
 #include <sys/file.h>
 #include <poll.h>
+#include <signal.h>
 
 #define SOCKET_NAME "lumen.mmshim.usb"
 #define CHUNK (64 * 1024)
@@ -222,11 +223,26 @@ static int bot_locked(const uint8_t *cdb, int cdb_len, int dir_in, uint8_t *data
     return csw[12];
 }
 
+/*
+ * Stopping without hanging the drive: a process killed between a command and its status leaves the drive's USB bridge waiting
+ * for good (only switching it off helps). SIGTERM is therefore held while a command runs and acted on right after it.
+ */
+static volatile sig_atomic_t in_command, term_pending;
+static void on_term(int sig)
+{
+    (void)sig;
+    if (in_command) term_pending = 1;
+    else _exit(143);
+}
+
 static int bot(const uint8_t *cdb, int cdb_len, int dir_in, uint8_t *data, unsigned len, unsigned timeout_ms, unsigned *done)
 {
     xlock(1);
+    in_command = 1;
     int r = bot_locked(cdb, cdb_len, dir_in, data, len, timeout_ms, done);
+    in_command = 0;
     xlock(0);
+    if (term_pending) _exit(143);
     return r;
 }
 
@@ -823,6 +839,10 @@ ssize_t recv(int fd, void *b, size_t n, int flags)
 __attribute__((constructor)) static void mmshim_children(void)
 {
     init_log();
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_term;
+    sigaction(SIGTERM, &sa, NULL);
     if (logging >= 3 && !getenv("LD_PRELOAD")) setenv("LD_PRELOAD", "/usr/lib/libmmshim.so", 1);
     if (logging >= 3) { char exe[256] = ""; ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1); if (n > 0) exe[n] = 0; LOG("process %d (parent %d) %s", (int)getpid(), (int)getppid(), exe); }
 }
@@ -838,4 +858,21 @@ int execve(const char *path, char *const argv[], char *const envp[])
         LOG("execve %s [%s]", path ? path : "(null)", a);
     }
     return re(path, argv, envp);
+}
+
+/* MakeMKV's own handler for SIGTERM would end it in the middle of a command: ours stays */
+int sigaction(int sig, const struct sigaction *act, struct sigaction *old)
+{
+    static int (*rs)(int, const struct sigaction *, struct sigaction *);
+    if (!rs) rs = dlsym(RTLD_NEXT, "sigaction");
+    if (sig == SIGTERM && act && act->sa_handler != on_term) return old ? rs(sig, NULL, old) : 0;
+    return rs(sig, act, old);
+}
+
+__sighandler_t signal(int sig, __sighandler_t h)
+{
+    static __sighandler_t (*rs)(int, __sighandler_t);
+    if (!rs) rs = dlsym(RTLD_NEXT, "signal");
+    if (sig == SIGTERM && h != on_term) return SIG_DFL;
+    return rs(sig, h);
 }

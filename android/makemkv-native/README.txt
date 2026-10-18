@@ -24,3 +24,13 @@ bdmenu (2026-10-17): the disc's own menu through libbluray, decrypted by libmmbd
   starts makemkvcon itself (MAKEMKVCON) and that child needs the drive shim: bdmenu sets LD_PRELOAD from BDM_PRELOAD
   (the host's own loader must not see it). The shim serves the fake /dev/sg0 as a file (read/pread/lseek via READ(10))
   and takes a file lock around each command (two processes use the drive).
+
+libcurl (2026-10-18): makemkvcon loads libcurl.so.4 at run time for everything it does on the net – above all the download of its
+  hashed key database ("HK", hkd_*.bin in ~/.MakeMKV/_private_data.tar), without which it says "the volume key is unknown" for
+  4K discs. Without the library it takes the net as off and says nothing. Built small in the Lima VM against Debian's armhf OpenSSL:
+    curl 8.14.1: ./configure --host=arm-linux-gnueabihf --prefix=/usr --with-openssl --with-zlib --without-libpsl --disable-ldap
+      --disable-ldaps --without-libidn2 --without-nghttp2 --without-brotli --without-zstd --without-libssh2 --disable-rtsp
+      --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smtp --disable-gopher --disable-mqtt
+      --disable-manual --disable-docs --enable-shared --disable-static --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt
+  shipped as libmk103.so (/lib/arm-linux-gnueabihf/libcurl.so.4) with libmk102.so (libssl.so.3, Debian 3.5.7, the same version as
+  the libcrypto.so.3 already there). The CA bundle is the one MakeMkv.ensureTree writes from the system's certificates.
