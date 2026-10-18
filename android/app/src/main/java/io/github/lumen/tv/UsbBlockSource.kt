@@ -224,7 +224,14 @@ class UsbBlockSource private constructor(
      *  is spinning up or has spun down is not a changed disc. */
     fun mediaChanged(): Boolean {
         val st = try { command(cdb(0x00, 0, 0, 0, 0, 0), null, 0, 0, 5000) } catch (_: IOException) { return false }
-        if (st == 0) return false
+        if (st == 0) {
+            // the "unit attention" of a new disc can be taken by another command first (or come as "becoming ready"): a disc of
+            // another size is another disc
+            val before = sectors
+            val b = ByteArray(8)
+            val ok = try { command(cdb(0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0), b, 0, 8, 10000) == 0 } catch (_: IOException) { false }
+            return ok && before > 0 && getBe32(b, 0) + 1 != before
+        }
         val (key, asc, ascq) = sense()
         if (asc == 0x3A) return true                                   // medium not present
         if (key == 6) return true                                      // unit attention: new medium / reset

@@ -98,7 +98,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     private fun busBlocked(d: Disc): Boolean = d.encrypted && d.busDisc == true && d.busDrive != false && d.busKey == null && d.key !in libreReady
 
     fun needsMakeMkv(key: String): Boolean = synchronized(open) { open[key] }?.let {
-        it.kind == "Blu-ray" && it.encrypted && (it.keys == null || (!it.uhd && busBlocked(it)))
+        it.kind == "Blu-ray" && it.encrypted && (it.keys == null || (!it.uhd && busBlocked(it)) || (it.uhd && it.key !in uhdTry))
     } ?: false
 
     fun lend(key: String): UsbDevice? {
@@ -126,11 +126,19 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
      */
     fun needsLibreDrive(key: String): Boolean = synchronized(open) { open[key] }?.let { it.uhd && it.encrypted && it.keys != null && key !in libreReady } ?: false
 
+    /**
+     * 4K discs the user chose to try the app's own way with (experimental: on the drive tested, reading such a disc has hung the drive
+     * until it was switched off, also with LibreDrive on). Without that choice a 4K disc is MakeMKV's alone.
+     */
+    val uhdTry: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
+    private fun uhdBlocked(d: Disc): Boolean = d.uhd && d.encrypted && (d.key !in uhdTry || d.key !in libreReady)
+
     fun isUhd(key: String): Boolean = synchronized(open) { open[key] }?.uhd ?: false
 
     fun reader(key: String, path: String): RandomReader? {
         if (needsLibreDrive(key)) return null
         val d = synchronized(open) { open[key] } ?: return null
+        if (uhdBlocked(d) && path.startsWith("BDMV/STREAM/", true)) return null
         if (d.encrypted) { ensureBus(d); if (busBlocked(d) && path.startsWith("BDMV/STREAM/", true)) return null }
         val r = d.udf?.open(path) ?: return null
         val keys = d.keys
@@ -161,6 +169,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
     fun fs(key: String): DiscFs? {
         if (needsLibreDrive(key)) return null
         val d = synchronized(open) { open[key] } ?: return null
+        if (uhdBlocked(d)) return null
         val udf = d.udf ?: return null
         if (d.encrypted && d.keys == null) return null
         if (d.encrypted) { ensureBus(d); if (busBlocked(d)) return null }
@@ -449,7 +458,7 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             return out
         }
         // keys known, but the drive would send the streams encrypted for the bus: MakeMKV plays it (or LibreDrive is switched on first)
-        if (d.encrypted && rel.isEmpty() && (needsMakeMkv(key) || needsLibreDrive(key))) {
+        if (d.encrypted && rel.isEmpty() && (needsMakeMkv(key) || needsLibreDrive(key) || uhdBlocked(d))) {
             out.put(JSONObject().put("name", t("Schutz dieser Disc (AACS)", "Protection of this disc (AACS)")).put("path", "disc:$key|#info").put("dir", false).put("action", "info").put("icon", "info"))
             return out
         }

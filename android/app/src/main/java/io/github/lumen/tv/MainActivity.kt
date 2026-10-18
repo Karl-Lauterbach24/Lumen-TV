@@ -89,6 +89,8 @@ class MainActivity : Activity() {
         discs.extraEntries = { key, rel -> mkEntries(key, rel) }
         discs.nameFor = { key -> mkDiscName(key) }
         discs.coverFor = { key, label ->
+            // (a drive whose disc is not read yet has only its own name: no picture for that – it would be some earlier disc's)
+            if (mkLabels[key] == null && discs.label(key).isEmpty()) return@coverFor ""
             val l = mkLabels[key] ?: label
             val c = ownCover(key, l).ifEmpty { makemkv.cover(l) }
             // a disc seen before: its titles from the memory (name, picture), once per start
@@ -719,7 +721,7 @@ class MainActivity : Activity() {
         if (titles == null) {
             if (rel.isNotEmpty()) return emptyList()
             // a 4K disc the key database knows: MakeMKV only switches LibreDrive on, the app plays it itself
-            if (discs.needsLibreDrive(key)) {
+            if (discs.needsLibreDrive(key) && key in discs.uhdTry) {
                 if (mkKey == null && synchronized(mkLibreTriggered) { mkLibreTriggered.add(key) }) kotlin.concurrent.thread { mkLibre(key) }
                 if (mkKey == key) note(t("4K-Disc wird vorbereitet …", "Preparing the 4K disc …"), t("MakeMKV schaltet LibreDrive ein, etwa zwei Minuten", "MakeMKV switches LibreDrive on, about two minutes"), "disc")
                 else action(t("4K-Disc vorbereiten", "Prepare the 4K disc"), t("LibreDrive über MakeMKV einschalten", "switch LibreDrive on through MakeMKV"), "mklibre", "disc")
@@ -737,6 +739,9 @@ class MainActivity : Activity() {
                     if (updates.makemkvNewer) t("MakeMKV ${updates.makemkvLatest} ist erschienen – damit sollte es gehen", "MakeMKV ${updates.makemkvLatest} is out – it should work with that")
                         else t("meist eine neue 4K-Disc (AACS 2): MakeMKV hat sie zur Auswertung gesendet, eine neuere Version löst das", "mostly a new 4K disc (AACS 2): MakeMKV has sent it for analysis, a newer version solves it"), "key")
                 action(t("Noch einmal versuchen", "Try again"), t("liest die Titel, etwa eine Minute", "reads the titles, about a minute"), "mkread", "refresh")
+                if (discs.isUhd(key) && discs.needsLibreDrive(key))
+                    action(t("Mit der Schlüsseldatenbank versuchen (experimentell)", "Try with the key database (experimental)"),
+                        t("LibreDrive, dann liest die App selbst – kann das Laufwerk aufhängen", "LibreDrive, then the app reads itself – may hang the drive"), "mkuhdtry", "key")
             } else action(t("Disc mit MakeMKV erkennen", "Identify the disc with MakeMKV"), t("liest die Titel, etwa eine Minute", "reads the titles, about a minute"), "mkread", "disc")
             return out
         }
@@ -1402,6 +1407,7 @@ class MainActivity : Activity() {
                     "#keys" -> discs.loadKeyDatabase(say)
                     "#info" -> say(discs.keyInfo(key, true))
                     "#mkread" -> mkRead(key, say)
+                    "#mkuhdtry" -> { discs.uhdTry.add(key); synchronized(mkLibreTriggered) { mkLibreTriggered.add(key) }; mkLibre(key) }
                     "#mklibre" -> { synchronized(mkLibreTriggered) { mkLibreTriggered.add(key) }; mkLibre(key) }
                     "#mkshift" -> mkShift(key)
                     "#mkdump" -> say(dumpMenuFiles(key))
