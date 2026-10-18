@@ -140,7 +140,16 @@ class MainActivity : Activity() {
         player?.let { if (playerLong == long) return it; it.release(); player = null }
         playerLong = long
         // the television's own decoders first; what it cannot decode (DTS, TrueHD, often Dolby) the app's FFmpeg does
-        val factory = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
+        val factory = object : DefaultRenderersFactory(this) {
+            // sound as PCM always: the television reports Dolby Digital passthrough (after a restart, with its audio output on
+            // "auto"), then cannot create the track for it ("Cannot create AudioTrack") – decoding here works in every setting
+            override fun buildAudioSink(context: android.content.Context, enableFloatOutput: Boolean, enableAudioTrackPlaybackParams: Boolean): androidx.media3.exoplayer.audio.AudioSink =
+                androidx.media3.exoplayer.audio.DefaultAudioSink.Builder()
+                    .setAudioCapabilities(androidx.media3.exoplayer.audio.AudioCapabilities.DEFAULT_AUDIO_CAPABILITIES)
+                    .setEnableFloatOutput(enableFloatOutput)
+                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                    .build()
+        }.setEnableDecoderFallback(true)
             .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
         // a short look-ahead: the menu of a disc runs ahead of the picture by what the player has buffered;
         // MakeMKV's stream comes in bursts: a longer one, but held to 32 MB (MakeMKV needs the memory of a small television)
@@ -170,7 +179,7 @@ class MainActivity : Activity() {
                     Player.STATE_ENDED -> {
                         // the disc's menu: its stream ends where the streams change (bdmenu says RESTART) and goes on in a new one
                         val rb = remoteBd
-                        if (rb != null && rb.opened) { mkLog("disc menu: the stream goes on in a new one"); restartMenuStream(p, rb) }
+                        if (rb != null && rb.opened) { mkLog("disc menu: the stream goes on in a new one (none was queued)"); restartMenuStream(p, rb) }
                         else event("ended")
                     }
                 }
@@ -1189,6 +1198,8 @@ class MainActivity : Activity() {
                 rb.close(); stopMakeMkv(); return
             }
             remoteBd = rb
+            // the next stream is queued at once: the player opens it while it plays the end of the old one (no still picture between)
+            rb.onRestart = { main.post { if (remoteBd === rb) player?.let { p -> p.addMediaSource(menuSource(rb)); mkLog("disc menu: the next stream is queued") } } }
             // (bdmenu stopping by itself – the disc could not be read on, a menu it cannot run – leaves no empty player behind)
             rb.onEnded = { main.post { if (remoteBd === rb) {
                 event("ended"); closePlayer()

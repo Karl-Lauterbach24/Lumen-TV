@@ -50,13 +50,19 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
             val root = try { p.javaClass.getDeclaredField("pid").apply { isAccessible = true }.getInt(p) } catch (_: Exception) { -1 }
             if (root > 0) {
                 val kids = ArrayList<Int>()
-                // (the processes under proot: children of children, of this app's user)
-                fun childrenOf(pp: Int) = java.io.File("/proc").listFiles()?.mapNotNull { f ->
-                    val pid = f.name.toIntOrNull() ?: return@mapNotNull null
-                    val stat = try { java.io.File(f, "stat").readText() } catch (_: Exception) { return@mapNotNull null }
-                    val ppid = stat.substringAfterLast(')').trim().split(' ').getOrNull(1)?.toIntOrNull()
-                    if (ppid == pp) pid else null
-                }.orEmpty()
+                // (the processes under proot: children of children, from the system's ps – listing /proc from Java is not possible
+                // here: this television has an entry there whose name is not valid UTF-8, and Android aborts on it)
+                val parents = HashMap<Int, MutableList<Int>>()
+                try {
+                    val ps = ProcessBuilder("ps", "-A", "-o", "PID,PPID").redirectErrorStream(true).start()
+                    ps.inputStream.bufferedReader().readLines().forEach { l ->
+                        val f = l.trim().split(Regex("\\s+"))
+                        val pid = f.getOrNull(0)?.toIntOrNull(); val ppid = f.getOrNull(1)?.toIntOrNull()
+                        if (pid != null && ppid != null) parents.getOrPut(ppid) { ArrayList() }.add(pid)
+                    }
+                    ps.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+                } catch (_: Exception) { }
+                fun childrenOf(pp: Int): List<Int> = parents[pp].orEmpty()
                 val todo = ArrayDeque(listOf(root))
                 while (todo.isNotEmpty()) { val q = todo.removeFirst(); for (c in childrenOf(q)) { kids.add(c); todo.add(c) } }
                 for (k in kids) try { android.os.Process.sendSignal(k, 15) } catch (_: Exception) { }

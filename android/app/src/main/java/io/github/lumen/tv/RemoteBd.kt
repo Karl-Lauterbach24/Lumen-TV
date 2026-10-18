@@ -24,6 +24,8 @@ class RemoteBd(private val makemkv: MakeMkv, private val log: (String) -> Unit) 
     @Volatile var keyUnknown = false
     /** bdmenu has ended by itself (not through [close]). */
     var onEnded: (() -> Unit)? = null
+    /** The stream goes on in another fifo ([fifo] is that one already). */
+    var onRestart: (() -> Unit)? = null
     @Volatile private var closing = false
     @Volatile var opened = false
         private set
@@ -55,6 +57,7 @@ class RemoteBd(private val makemkv: MakeMkv, private val log: (String) -> Unit) 
                         l.startsWith("RESTART ") -> {
                             fifo = File(l.substringAfter(' ').trim().replace("/tmp/menu", makemkv.menuDir().absolutePath))
                             log("bdmenu: the streams change, the stream goes on in ${fifo.name}")
+                            onRestart?.invoke()
                         }
                     }
                 }

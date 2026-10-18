@@ -281,14 +281,16 @@ static void retime(uint8_t *buf, int len)
             if (flags >= 2) {
                 int sid = p[at + 3], cls = (sid >= 0xe0 && sid <= 0xef) ? 0 : 1;
                 int64_t raw = ts_read33(p + at + 9);
-                if (g_pend && g_last_pts[cls] > 0) {
-                    /* the clip's pictures start further ahead of its clock than the last clip's ended: without this the player sees a hole of half a second in sound and picture (and its audio sink stops on it) */
-                    int64_t target = g_last_pts[cls] + (cls ? 1000 : 3750);
+                if (g_pend && (g_last_pts[0] > 0 || g_last_pts[1] > 0)) {
+                    /* the clip's pictures start further ahead of its clock than the last clip's ended: without this the player sees a hole of half a second in sound and picture (and its audio sink stops on it).
+                       The new clip begins after the later end of picture and sound: set from the sound's end alone its pictures fell before the last clip's last ones, and the player dropped them as late */
+                    int64_t end0 = g_last_pts[0] + 3750, end1 = g_last_pts[1] + 1000;
+                    int64_t target = end0 > end1 ? end0 : end1;
                     g_off = ((target - raw) % MOD33 + MOD33) % MOD33;
                     g_pend = 0;
                 }
                 int64_t pts = (raw + g_off) % MOD33;
-                g_last_pts[cls] = pts;
+                if (pts > g_last_pts[cls] || g_last_pts[cls] - pts > MOD33 / 2) g_last_pts[cls] = pts;
                 ts_write33(p + at + 9, pts, flags == 3 ? 3 : 2);
                 if (flags == 3 && at + 19 <= 188) {
                     int64_t dts = (ts_read33(p + at + 14) + g_off) % MOD33;
@@ -313,6 +315,10 @@ static uint32_t crc32_mpeg(const uint8_t *d, int n)
     }
     return c;
 }
+/* the audio PIDs of the PMT and the one the disc chose (see update_audio_pid) */
+static int g_audio_pids[16], g_naudio, g_audio_pid;
+static int is_audio_type(int st) { return st == 0x0f || st == 0x03 || st == 0x04 || (st >= 0x80 && st <= 0x87) || st == 0xa1 || st == 0xa2; }
+static int is_audio_pid(int pid) { for (int i = 0; i < g_naudio; ++i) if (g_audio_pids[i] == pid) return 1; return 0; }
 static int g_pmt_pid = -1, g_pmt_dn = -1;
 static char g_pmt_desc[160];
 static uint8_t g_pat[188];
@@ -340,6 +346,24 @@ static int fix_pmt(uint8_t *buf, int len)
             if (5 + p[4] + 3 + sl > 188) continue;                      /* (a section over several packets is left alone) */
             int pil = ((s[10] & 0xf) << 8) | s[11];
             int i = 12 + pil, end = 3 + sl - 4, changed = 0;
+            if (g_audio_pid) {
+                /* the entries of the audio PIDs left out go from the PMT too */
+                int w = i, j = i;
+                while (j + 5 <= end) {
+                    int l = 5 + (((s[j + 3] & 0xf) << 8) | s[j + 4]);
+                    int st = s[j], pid = ((s[j + 1] & 0x1f) << 8) | s[j + 2];
+                    if (!(is_audio_type(st) && pid != g_audio_pid)) { if (w != j) memmove(s + w, s + j, (size_t)l); w += l; }
+                    else changed = 1;
+                    j += l;
+                }
+                if (changed) {
+                    int removed = end - w;
+                    sl -= removed;
+                    s[1] = (uint8_t)((s[1] & 0xf0) | ((sl >> 8) & 0x0f)); s[2] = (uint8_t)sl;
+                    end = w;
+                    memset(s + end + 4, 0xff, (size_t)removed);     /* (stuffing after the new CRC) */
+                }
+            }
             char desc[160]; int dn = 0;
             for (int j = i; j + 5 <= end && dn < 140; j += 5 + (((s[j + 3] & 0xf) << 8) | s[j + 4]))
                 dn += snprintf(desc + dn, sizeof(desc) - (size_t)dn, " %02x:%04x", map_type(s[j]), ((s[j + 1] & 0x1f) << 8) | s[j + 2]);
@@ -376,6 +400,48 @@ static int g_pes_len[MAXDTS], g_cc[MAXDTS];
 
 static int dts_index(int pid) { for (int i = 0; i < g_dts_n; ++i) if (g_dts_pid[i] == pid) return i; return -1; }
 
+/*
+ * The sound the disc chose (PSR 1, its "audio_stream"): a transport stream says nothing about languages, so the player took the track
+ * with the most channels (an English one, where the disc plays German). Only the chosen audio PID is passed on; when the disc's menu
+ * changes the language, the PMT changes and the stream goes on in a new one (see RESTART).
+ */
+static int g_playlist = -1, g_item, g_audio_stream;
+
+static void update_audio_pid(BLURAY *bd)
+{
+    int pid = 0;
+    if (g_audio_stream > 0 && g_audio_stream < 0xff && g_playlist >= 0) {
+        BLURAY_TITLE_INFO *ti = bd_get_playlist_info(bd, (uint32_t)g_playlist, 0);
+        if (ti) {
+            if ((unsigned)g_item < ti->clip_count && g_audio_stream <= ti->clips[g_item].audio_stream_count)
+                pid = ti->clips[g_item].audio_streams[g_audio_stream - 1].pid;
+            bd_free_title_info(ti);
+        }
+    }
+    if (pid != g_audio_pid) { g_audio_pid = pid; fprintf(stderr, "AUDIO stream %d pid %04x\n", g_audio_stream, pid); }
+}
+
+static void follow_event(BLURAY *bd, const BD_EVENT *ev)
+{
+    if (ev->event == BD_EVENT_PLAYLIST) { g_playlist = (int)ev->param; g_item = 0; update_audio_pid(bd); }
+    else if (ev->event == BD_EVENT_PLAYITEM) { g_item = (int)ev->param; update_audio_pid(bd); }
+    else if (ev->event == BD_EVENT_AUDIO_STREAM) { g_audio_stream = (int)ev->param; update_audio_pid(bd); }
+}
+
+/* the packets of the audio PIDs the disc did not choose are left out (in place; returns the new length) */
+static int drop_audio(uint8_t *b, int n)
+{
+    if (!g_audio_pid) return n;
+    int w = 0;
+    for (int o = 0; o + 188 <= n; o += 188) {
+        int pid = ((b[o + 1] & 0x1f) << 8) | b[o + 2];
+        if (pid != g_audio_pid && is_audio_pid(pid)) continue;
+        if (w != o) memmove(b + w, b + o, 188);
+        w += 188;
+    }
+    return w;
+}
+
 static void learn_dts(const uint8_t *p)
 {
     /* (a PMT: which PIDs carry DTS-HD; taken before fix_pmt rewrites the types) */
@@ -394,6 +460,7 @@ static void learn_dts(const uint8_t *p)
     while (i + 5 <= end) {
         int st = s[i], pid = ((s[i + 1] & 0x1f) << 8) | s[i + 2], l = ((s[i + 3] & 0xf) << 8) | s[i + 4];
         if ((st == 0x85 || st == 0x86) && n < MAXDTS) pids[n++] = pid;
+        if (is_audio_type(st) && !is_audio_pid(pid) && g_naudio < 16) g_audio_pids[g_naudio++] = pid;
         i += 5 + l;
     }
     for (int k = 0; k < n; ++k) if (dts_index(pids[k]) < 0 && g_dts_n < MAXDTS) { g_dts_pid[g_dts_n] = pids[k]; g_pes_len[g_dts_n] = 0; g_dts_n++; }
@@ -579,6 +646,7 @@ static int serve(const char *device, const char *fifo, const char *lang)
         int n = bd_read_ext(bd, tmp, sizeof(tmp), &ev);
         if (ev.event != BD_EVENT_NONE) {
             event_name(&ev);
+            follow_event(bd, &ev);
             if (ev.event == BD_EVENT_SOUND_EFFECT) {
                 BLURAY_SOUND_EFFECT fx;
                 if (bd_get_sound_effect(bd, ev.param, &fx) > 0 && fx.samples && fx.num_frames) {
@@ -589,7 +657,7 @@ static int serve(const char *device, const char *fifo, const char *lang)
                 }
             }
         }
-        while (bd_get_event(bd, &ev) && ev.event != BD_EVENT_NONE) event_name(&ev);
+        while (bd_get_event(bd, &ev) && ev.event != BD_EVENT_NONE) { event_name(&ev); follow_event(bd, &ev); }
         if (n < 0) { fprintf(stderr, "END bd_read_ext returned %d\n", n); break; }
         if (n > 0) {
             int w = 0;
@@ -597,6 +665,7 @@ static int serve(const char *device, const char *fifo, const char *lang)
             retime(out, w);
             w = strip_dtshd(out, w, out2);
             uint8_t *buf = out2;
+            w = drop_audio(buf, w);
             int cut = fix_pmt(buf, w);
             if (cut < 0) { if (write_all(fd, buf, w) < 0) goto end; }
             else {
