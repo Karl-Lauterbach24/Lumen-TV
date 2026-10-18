@@ -262,6 +262,11 @@ static int do_sg_io(struct sg_io_hdr *h)
         while (w_busy && now_ms() - w_progress_ms > 150) usleep(20000);
         held_ms += now_ms() - w0;
     }
+    /* SET CD SPEED: MakeMKV holds the drive at 9000 KB/s; the drive reads as fast as it can (MMSHIM_SPEED=keep leaves it) */
+    if (op == 0xbb && h->cmd_len >= 6) {
+        const char *sp = getenv("MMSHIM_SPEED");
+        if (!(sp && !strcmp(sp, "keep"))) { ((uint8_t *)h->cmdp)[2] = 0xff; ((uint8_t *)h->cmdp)[3] = 0xff; }
+    }
     struct timespec c0;
     clock_gettime(CLOCK_MONOTONIC, &c0);
     uint8_t key = 0, asc = 0, ascq = 0;

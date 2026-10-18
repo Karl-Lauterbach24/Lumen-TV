@@ -184,6 +184,12 @@ class MainActivity : Activity() {
                 val failed = bdFs?.failedUnits() ?: 0
                 val why = when {
                     failed > 20 -> "The disc's stream could not be decrypted ($failed units). " + discs.keyInfo(bdKey)
+                    // a 4K picture on a television whose decoder stops at 1920x1088
+                    fmt != null && fmt.sampleMimeType?.startsWith("video/") == true && (fmt.width > 1920 || fmt.height > 1088) && !videoFits(fmt) ->
+                        t("Dieser Fernseher kann ${fmt.width}×${fmt.height} nicht abspielen: sein Video-Decoder schafft höchstens ${maxVideo()}. " +
+                            "Die 4K-Disc wird gelesen und entschlüsselt, nur das Bild geht nicht – die Blu-ray in Full HD (oft in der Packung) oder Lumen am Computer (rechnet das Bild herunter) gehen.",
+                          "This television cannot play ${fmt.width}×${fmt.height}: its video decoder stops at ${maxVideo()}. The 4K disc is read and decrypted, only the picture does not work – " +
+                            "the Full HD Blu-ray (often in the box) or Lumen on a computer (which scales the picture down) work.")
                     error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES ||
                     error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ||
                     error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ->
@@ -428,6 +434,22 @@ class MainActivity : Activity() {
         p.prepare()
         p.playWhenReady = true
     }
+
+    /** Whether a hardware decoder of this television takes [f]'s size. */
+    private fun videoFits(f: androidx.media3.common.Format): Boolean = try {
+        android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS).codecInfos.any { c ->
+            !c.isEncoder && c.supportedTypes.any { it.equals(f.sampleMimeType, true) } &&
+                c.getCapabilitiesForType(f.sampleMimeType).videoCapabilities?.isSizeSupported(f.width, f.height) == true &&
+                !c.name.startsWith("c2.android") && !c.name.startsWith("OMX.google")
+        }
+    } catch (_: Exception) { true }
+
+    private fun maxVideo(): String = try {
+        android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS).codecInfos
+            .filter { !it.isEncoder && it.supportedTypes.any { t -> t.equals("video/hevc", true) } && !it.name.startsWith("c2.android") && !it.name.startsWith("OMX.google") }
+            .mapNotNull { c -> c.getCapabilitiesForType("video/hevc").videoCapabilities?.let { "${it.supportedWidths.upper}×${it.supportedHeights.upper}" } }
+            .firstOrNull() ?: "Full HD"
+    } catch (_: Exception) { "Full HD" }
 
     private fun closeBd() {
         val b = bd ?: return

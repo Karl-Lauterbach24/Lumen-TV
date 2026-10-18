@@ -381,10 +381,20 @@ class Discs(private val activity: Activity, private val changed: () -> Unit) {
             if (!src.readCapacity()) return Disc(key, label, "", null, src, false, "unreadable")
             return describe(key, label, Udf(src), src)
         } catch (e: Exception) {
+            // a drive that does not answer at all (its USB bridge waits for a command's end that never came): the port is reset,
+            // as if the cable were pulled – the drive comes back under a new number
+            android.util.Log.w("LumenTV", "the drive does not answer ($e)")
+            val now = System.currentTimeMillis()
+            if (now - (lastReset[key] ?: 0L) > 60_000) {
+                lastReset[key] = now
+                val ok = try { conn.javaClass.getMethod("resetDevice").invoke(conn) as? Boolean ?: false } catch (x: Throwable) { android.util.Log.w("LumenTV", "USB reset: $x"); false }
+                android.util.Log.i("LumenTV", "USB reset of the drive: ${if (ok) "done" else "not possible"}")
+            }
             src.close()
             return Disc(key, name, "", null, null, false, "unreadable")
         }
     }
+    private val lastReset = HashMap<String, Long>()
 
     private fun describe(key: String, fallbackLabel: String, udf: Udf, src: BlockSource?): Disc {
         val bd = udf.exists("BDMV/index.bdmv")
