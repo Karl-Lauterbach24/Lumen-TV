@@ -616,6 +616,7 @@ class MainActivity : Activity() {
                         (plan?.let { " · ${it.bytes shr 20} MB" } ?: ""), "tune")
                 item("cache-size", t("Größe des Zwischenspeichers", "Cache size"), if (makemkv.cacheMb > 0) "${makemkv.cacheMb} MB" else t("automatisch", "automatic"), "tune")
                 item("tmdb", t("Filmcover (TMDB)", "Film covers (TMDB)"), if (makemkv.tmdbKey.isEmpty()) t("Schlüssel eingeben", "enter a key") else t("Schlüssel eingetragen", "key entered"), "film")
+                item("quick", t("Schnellstart", "Quick start"), if (makemkv.quickStart) t("an: der Film wird schon auf der Seite der Disc vorbereitet", "on: the film is prepared on the disc's page") else t("aus", "off"), "film")
                 item("keydb", t("Schlüsseldatenbank laden", "Load the key database"), t("für Discs ohne MakeMKV", "for discs without MakeMKV"), "download")
                 item("note", "MakeMKV 2.0", (if (makemkv.abi == "arm64-v8a") "64 Bit" else "32 Bit") + " · makemkv-log.txt", "info", true)
             }
@@ -634,6 +635,7 @@ class MainActivity : Activity() {
             "cache-size" -> makemkv.cacheMb = next(listOf("0", "64", "128", "256", "512", "1024"), makemkv.cacheMb.toString()).toInt()
             "tmdb" -> askText(t("TMDB-Schlüssel (kostenlos auf themoviedb.org)", "TMDB key (free at themoviedb.org)"), "API key", makemkv.tmdbKey) { k -> makemkv.tmdbKey = k; say(t("Gespeichert. Cover erscheinen beim nächsten Erkennen einer Disc.", "Saved. Covers appear the next time a disc is identified.")) }
             "keydb" -> discs.loadKeyDatabase { say(it) }
+            "quick" -> makemkv.quickStart = !makemkv.quickStart
             "upd-check", "upd-app", "upd-mk" -> {
                 say(t("Suche nach Updates …", "Looking for updates …"), 3000)
                 val ok = updates.check()
@@ -796,20 +798,23 @@ class MainActivity : Activity() {
             return out
         }
         if (rel.isNotEmpty()) return emptyList()
+        // the title most likely wanted is prepared while the page is looked at (see warmMakeMkv)
+        if (makemkv.quickStart) d.main.firstOrNull()?.let { warmMakeMkv(Uri.parse("makemkv://$key/${it.id}")) }
         out.add(JSONObject().put("name", mkDiscName(key).ifEmpty { t("Unbekannte Disc", "Unknown disc") })
             .put("detail", if (d.kind == "episodes") t("${d.main.size} Episoden", "${d.main.size} episodes") else "Film · ${d.main.firstOrNull()?.minutes ?: 0} min")
             .put("icon", if (d.kind == "episodes") "episodes" else "film").put("path", "").put("dir", false).put("off", true))
         // the episodes follow one another (the page goes on to the next when one ends); the rest stands alone
         group = "episodes"
         // the disc's own menu (background picture and sound, its buttons): the disc plays as a whole
-        menuRow()
         if (d.kind == "episodes") d.main.forEachIndexed { i, tt ->
             val e = guide?.episodes?.getOrNull(i)
-            play(tt, if (e != null) t("Folge ${e.number} · ${e.name}", "Episode ${e.number} · ${e.name}") else "Episode ${i + 1}", "film")
+            play(tt, if (e != null) (if (e.number == 0) "Special · ${e.name}" else t("Folge ${e.number} · ${e.name}", "Episode ${e.number} · ${e.name}")) else "Episode ${i + 1}", "film")
         }
         else d.main.firstOrNull()?.let { play(it, t("Film abspielen", "Play the film"), "film") }
         group = "all"
         if (d.kind == "episodes") d.all?.let { play(it, t("Alle Episoden hintereinander", "All episodes in a row"), "episodes") }
+        // the disc's own menu after what is played most (the film, the episodes)
+        menuRow()
         // the audio and subtitle tracks, chosen before playing: a page each (the same language may come twice: other format, other dub)
         if (mkStreams(key, "audio").isNotEmpty())
             out.add(JSONObject().put("name", t("Ton", "Audio")).put("detail", mkPickLabel(key, "audio")).put("icon", "volume").put("path", "disc:$key|#audio/").put("dir", true))
@@ -1231,9 +1236,41 @@ class MainActivity : Activity() {
     }
 
     /** Runs on a worker thread: lends the drive to MakeMKV, has it stream the title, plays the stream. */
-    private fun startMakeMkv(uri: Uri) {
+    /**
+     * Quick start: the disc page's main title is prepared in the background (MakeMKV's scan of half a minute, the cache's first
+     * seconds) while the user looks at the page; started then, it plays at once. Another choice ends the preparation.
+     */
+    @Volatile private var mkWarm: Uri? = null
+    @Volatile private var mkWarmPlay = false
+    @Volatile private var mkQuiet = false
+    private val mkWarmTried = HashSet<String>()
+    private fun tell(msg: String, ms: Int = 7000) { if (!mkQuiet) say(msg, ms) }
+
+    private fun warmMakeMkv(uri: Uri) {
+        if (mkKey != null || mkMenuState.isNotEmpty() || player?.isPlaying == true || remoteBd != null) return
+        if (!synchronized(mkWarmTried) { mkWarmTried.add(uri.toString()) }) return
+        kotlin.concurrent.thread { startMakeMkv(uri, play = false) }
+    }
+
+    private fun startMakeMkv(uri: Uri, play: Boolean = true) {
         val key = uri.host ?: return
         val which = uri.path.orEmpty().trim('/')
+        if (play) {
+            val w = mkWarm
+            if (w != null && w == uri && mkKey == key) {
+                if (mkPipe != null && !mkQuiet) { mkWarm = null; mkLog("quick start: $uri"); main.post { open(uri, false, null) }; return }
+                mkWarmPlay = true; mkQuiet = false; mkLog("quick start: waits for the preparation of $uri")
+                say(t("Wird gestartet …", "Starting …"), 60000)
+                return
+            }
+            if (w != null && mkKey != null) {     // another title was prepared: that one ends first
+                mkLog("quick start: $w is not wanted, it is stopped")
+                mkWarm = null; mkWarmPlay = false
+                stopMakeMkv()
+            }
+        }
+        mkQuiet = !play
+        if (!play) mkWarm = uri
         if (mkMenuState.isNotEmpty()) {          // the menu is being read: the film comes first
             mkWantsDrive = true; makemkv.stop()
             for (i in 0 until 40) { if (mkMenuState.isEmpty()) break; Thread.sleep(500) }
@@ -1244,20 +1281,20 @@ class MainActivity : Activity() {
         closed.await()
         mkLabel(key)
         mkLog("---- play $uri")
-        if (makemkv.keyMode.isEmpty()) say(t("MakeMKV hat noch keinen Schlüssel: Beta-Schlüssel aus dem Forum wählen oder eigenen eingeben (in der Liste der Disc).", "MakeMKV has no key yet: choose the forum's beta key or enter your own (in the drive's list)."), 10000)
+        if (makemkv.keyMode.isEmpty()) tell(t("MakeMKV hat noch keinen Schlüssel: Beta-Schlüssel aus dem Forum wählen oder eigenen eingeben (in der Liste der Disc).", "MakeMKV has no key yet: choose the forum's beta key or enter your own (in the drive's list)."), 10000)
         val device = discs.lend(key)
-        if (device == null) { say(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); discs.giveBack(key); return }
+        if (device == null) { tell(t("Das Laufwerk ist nicht mehr da.", "The drive is gone.")); discs.giveBack(key); return }
         mkKey = key
         try {
-            say(t("MakeMKV öffnet das Laufwerk …", "MakeMKV: opening the drive …"))
-            if (!makemkv.openBridge(device)) { say(t("MakeMKV: das Laufwerk lässt sich nicht öffnen (siehe makemkv-log.txt).", "MakeMKV: the drive could not be opened (see makemkv-log.txt).")); stopMakeMkv(); return }
+            tell(t("MakeMKV öffnet das Laufwerk …", "MakeMKV: opening the drive …"))
+            if (!makemkv.openBridge(device)) { tell(t("MakeMKV: das Laufwerk lässt sich nicht öffnen (siehe makemkv-log.txt).", "MakeMKV: the drive could not be opened (see makemkv-log.txt).")); stopMakeMkv(); return }
             if (mkReload || !makemkv.identify()) {
                 mkReload = false
                 mkLog("drive stuck before the start: eject and reload")
-                say(t("Das Laufwerk antwortet nicht: die Disc wird aus- und wieder eingezogen …", "The drive does not answer: the disc is ejected and loaded again …"), 60000)
+                tell(t("Das Laufwerk antwortet nicht: die Disc wird aus- und wieder eingezogen …", "The drive does not answer: the disc is ejected and loaded again …"), 60000)
                 if (!makemkv.ejectAndReload() || !makemkv.identify()) {
                     mkLog("drive still stuck: the user is asked to switch it off and on")
-                    say(t("Das Laufwerk antwortet weiterhin nicht. Bitte aus- und wieder einschalten und den Film neu starten.", "The drive still does not answer. Switch the drive off and on again, then start the film again."), 30000)
+                    tell(t("Das Laufwerk antwortet weiterhin nicht. Bitte aus- und wieder einschalten und den Film neu starten.", "The drive still does not answer. Switch the drive off and on again, then start the film again."), 30000)
                     stopMakeMkv(); return
                 }
             }
@@ -1268,17 +1305,17 @@ class MainActivity : Activity() {
                 // the drive answers reads with timeouts: the disc out and in once; then it is the user's turn
                 if (attempt == 1) {
                     mkLog("drive stuck: eject and reload")
-                    say(t("Das Laufwerk antwortet nicht mehr: die Disc wird aus- und wieder eingezogen …", "The drive stopped answering: the disc is ejected and loaded again …"), 60000)
+                    tell(t("Das Laufwerk antwortet nicht mehr: die Disc wird aus- und wieder eingezogen …", "The drive stopped answering: the disc is ejected and loaded again …"), 60000)
                     mkPipe?.close(); mkPipe = null
                     if (!makemkv.ejectAndReload()) break
                 }
             }
             mkLog("drive still stuck: the user is asked to switch it off and on")
-            say(t("Das Laufwerk antwortet weiterhin nicht. Bitte aus- und wieder einschalten und den Film neu starten.", "The drive still does not answer. Switch the drive off and on again, then start the film again."), 30000)
+            tell(t("Das Laufwerk antwortet weiterhin nicht. Bitte aus- und wieder einschalten und den Film neu starten.", "The drive still does not answer. Switch the drive off and on again, then start the film again."), 30000)
             stopMakeMkv()
         } catch (e: Throwable) {
             mkLog("failed: ${android.util.Log.getStackTraceString(e)}")
-            say("MakeMKV: $e")
+            tell("MakeMKV: $e")
             stopMakeMkv()
         }
     }
@@ -1287,7 +1324,7 @@ class MainActivity : Activity() {
     private fun mkAttempt(key: String, which: String, uri: Uri): Boolean {
         var titles = mkTitles[key]
         if (titles == null) {
-            say(t("MakeMKV liest die Disc (dauert etwa eine Minute) …", "MakeMKV: reading the disc (this takes a minute) …"), 60000)
+            tell(t("MakeMKV liest die Disc (dauert etwa eine Minute) …", "MakeMKV: reading the disc (this takes a minute) …"), 60000)
             titles = makemkv.titles()
             if (makemkv.driveStuck) return false
             mkLog("titles: " + titles.joinToString(" | "))
@@ -1296,27 +1333,34 @@ class MainActivity : Activity() {
         }
         if (mkKey != key) return true
         val t = (if (which == "main") makemkv.identify(titles).let { d -> d.all ?: d.main.firstOrNull() } else titles.firstOrNull { it.id.toString() == which })
-        if (t == null) { say(t("MakeMKV hat auf dieser Disc keinen Titel gefunden (siehe makemkv-log.txt).", "MakeMKV found no title on this disc (see makemkv-log.txt)."), 10000); stopMakeMkv(); return true }
-        say(t("Wird gestartet (${t.durationMs / 60000} min, etwa eine Minute) …", "Starting (${t.durationMs / 60000} min, about a minute) …"), 60000)
+        if (t == null) { tell(t("MakeMKV hat auf dieser Disc keinen Titel gefunden (siehe makemkv-log.txt).", "MakeMKV found no title on this disc (see makemkv-log.txt)."), 10000); stopMakeMkv(); return true }
+        tell(t("Wird gestartet (${t.durationMs / 60000} min, etwa eine Minute) …", "Starting (${t.durationMs / 60000} min, about a minute) …"), 60000)
         makemkv.clearCache()
         mkPlaying = t; mkPlayingLabel = mkLabel(key); picksFor = null
         val plan = makemkv.cachePlan()
         mkLog("cache: $plan (${plan.why})")
         // (no SIGSTOP: under proot it stopped makemkvcon's threads one by one and SIGCONT did not bring them all back;
         // the drive bridge holds MakeMKV's reading instead while the cache is full)
-        val pipe = PipeStream(makemkv.stream(t), plan.bytes, plan.file, { mkLog(it) })
+        // full speed while the cache fills (the start, after a jump), quiet once a third of it is ahead; full again below a sixth
+        makemkv.driveSpeed(0)
+        val pipe = PipeStream(makemkv.stream(t), plan.bytes, plan.file, { mkLog(it) }, level = { f ->
+            if (f < 0.17) makemkv.driveSpeed(0) else if (f > 0.33) makemkv.driveSpeed(MakeMkv.QUIET_KBS)
+        })
         mkPipe = pipe
         val t0 = System.currentTimeMillis()
         if (!pipe.awaitStart()) {
             if (makemkv.driveStuck) return false
-            say(t("MakeMKV hat vor dem Film aufgehört (siehe makemkv-log.txt).", "MakeMKV stopped before the film began (see makemkv-log.txt)."), 10000); stopMakeMkv(); return true
+            tell(t("MakeMKV hat vor dem Film aufgehört (siehe makemkv-log.txt).", "MakeMKV stopped before the film began (see makemkv-log.txt)."), 10000); stopMakeMkv(); return true
         }
         mkLog("first bytes after ${System.currentTimeMillis() - t0} ms")
         // a head start: the player begins when a few seconds of film are in the cache
-        val until = System.currentTimeMillis() + 15000
-        while (System.currentTimeMillis() < until && pipe.ahead() < minOf(plan.bytes / 2, 48L shl 20) && mkKey == key) Thread.sleep(200)
+        // (a short one: the drive goes on at full speed while the film begins, the cache fills behind it)
+        val until = System.currentTimeMillis() + 8000
+        while (System.currentTimeMillis() < until && pipe.ahead() < minOf(plan.bytes / 2, 20L shl 20) && mkKey == key) Thread.sleep(200)
         mkLog("player starts with %.0f MB in the cache".format(java.util.Locale.ROOT, pipe.ahead() / 1e6))
         if (mkKey != key) return true
+        if (mkQuiet && !mkWarmPlay) { mkLog("quick start: $uri is ready"); mkQuiet = false; return true }
+        mkWarm = null; mkWarmPlay = false; mkQuiet = false
         main.post { open(uri, false, null) }
         return true
     }
@@ -1324,8 +1368,10 @@ class MainActivity : Activity() {
     private fun stopMakeMkv() {
         val key = mkKey ?: return
         mkKey = null
+        mkWarm = null; mkWarmPlay = false; mkQuiet = false
         mkLog("---- stop (${mkPipe?.position?.let { "%.1f MB played".format(java.util.Locale.ROOT, it / 1e6) } ?: "nothing played"})")
         makemkv.stop()
+        makemkv.driveSpeed(0)
         mkPipe?.close(); mkPipe = null
         makemkv.closeBridge()
         discs.giveBack(key)

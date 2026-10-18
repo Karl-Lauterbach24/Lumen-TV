@@ -47,12 +47,20 @@ object EpisodeGuide {
             for (i in 0 until minOf(found.length(), 5)) {
                 val show = found.getJSONObject(i).getJSONObject("show")
                 // (one show that does not answer in time – a long one, like the Doctor Who of 1963 – is left out, not the whole look-up)
-                val eps = try { JSONArray(get("https://api.tvmaze.com/shows/${show.getInt("id")}/episodes")) }
+                val eps = try { JSONArray(get("https://api.tvmaze.com/shows/${show.getInt("id")}/episodes?specials=1")) }
                     catch (ex: Exception) { log("TVmaze: ${show.optString("name")} (${show.optString("premiered")}): $ex"); continue }
-                val inSeason = (0 until eps.length()).map { eps.getJSONObject(it) }
-                    .filter { it.optInt("season") == season && !it.isNull("number") }
-                    .map { Episode(season, it.getInt("number"), it.optString("name"), it.optInt("runtime", show.optInt("averageRuntime", 0))) }
-                    .sortedBy { it.number }
+                // the season as the boxes have it: its episodes, led by a long special shown after the last season's finale
+                // (Doctor Who's Christmas specials: TVmaze files "The Christmas Invasion" under season 1, the box of season 2
+                // begins with it); short extras ("Attack of the Graske", 14 min) are not episodes
+                val all = (0 until eps.length()).map { eps.getJSONObject(it) }
+                fun air(o: JSONObject) = o.optString("airstamp", o.optString("airdate"))
+                fun regular(s: Int) = all.filter { it.optInt("season") == s && !it.isNull("number") }.sortedBy { it.getInt("number") }
+                val lastBefore = regular(season - 1).maxOfOrNull { air(it) }
+                val lead = if (lastBefore == null) emptyList() else all.filter { it.optInt("season") == season - 1 && it.isNull("number") &&
+                    it.optInt("runtime") >= 40 && air(it) > lastBefore }.sortedBy { air(it) }
+                val inSeason = (lead + regular(season)).map {
+                    Episode(season, if (it.isNull("number")) 0 else it.getInt("number"), it.optString("name"), it.optInt("runtime", show.optInt("averageRuntime", 0)))
+                }
                 if (inSeason.size < minutes.size) continue
                 val k = minutes.size
                 val discs = maxOf(1, inSeason.size / k)

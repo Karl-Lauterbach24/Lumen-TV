@@ -50,6 +50,7 @@ static unsigned long long held_ms;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int usb_fd = -1, ep_in, ep_out, iface;
 static uint32_t tag = 1;
+static int speed_now;          /* a SET CD SPEED to send before the next command (see sg_io) */
 static unsigned long long stat_bytes, stat_cmds, stat_last_bytes;
 static struct timespec stat_start, stat_last;
 static int logging = -1;
@@ -262,15 +263,40 @@ static int do_sg_io(struct sg_io_hdr *h)
         while (w_busy && now_ms() - w_progress_ms > 150) usleep(20000);
         held_ms += now_ms() - w0;
     }
-    /* SET CD SPEED: MakeMKV holds the drive at 9000 KB/s; the drive reads as fast as it can (MMSHIM_SPEED=keep leaves it) */
-    if (op == 0xbb && h->cmd_len >= 6) {
-        const char *sp = getenv("MMSHIM_SPEED");
-        if (!(sp && !strcmp(sp, "keep"))) { ((uint8_t *)h->cmdp)[2] = 0xff; ((uint8_t *)h->cmdp)[3] = 0xff; }
+    /*
+     * The drive's speed is the app's choice, not MakeMKV's: /tmp/.mmshim.speed holds the read speed in KB/s (0 or missing: as
+     * fast as the drive can). The app asks for full speed while its cache fills and for a quiet one once enough is there.
+     * MakeMKV's own SET CD SPEED is turned into that value; a change is sent before the next read. (MMSHIM_SPEED=keep: MakeMKV's.)
+     */
+    const char *keep = getenv("MMSHIM_SPEED");
+    if (!(keep && !strcmp(keep, "keep"))) {
+        static long long checked_ms;
+        static int want = -1, sent = -2;
+        long long nowm = now_ms();
+        if (nowm - checked_ms > 1500) {
+            checked_ms = nowm;
+            int v = 0;
+            int (*ro)(const char *, int, ...) = dlsym(RTLD_NEXT, "open");
+            int f = ro("/tmp/.mmshim.speed", O_RDONLY);
+            if (f >= 0) { char b[16] = ""; ssize_t k = read(f, b, sizeof(b) - 1); if (k > 0) { b[k] = 0; v = atoi(b); } close(f); }
+            want = v;
+        }
+        int kbs = want > 0 && want < 0xffff ? want : 0xffff;
+        if (op == 0xbb && h->cmd_len >= 6) { ((uint8_t *)h->cmdp)[2] = (uint8_t)(kbs >> 8); ((uint8_t *)h->cmdp)[3] = (uint8_t)kbs; sent = kbs; }
+        else if ((op == 0x28 || op == 0xa8) && sent != kbs) { speed_now = kbs; sent = kbs; }
     }
     struct timespec c0;
     clock_gettime(CLOCK_MONOTONIC, &c0);
     uint8_t key = 0, asc = 0, ascq = 0;
     pthread_mutex_lock(&lock);
+    if (speed_now) {
+        /* (under the lock: no other thread's command between) */
+        uint8_t sp[12] = { 0xbb, 0, (uint8_t)(speed_now >> 8), (uint8_t)speed_now, 0xff, 0xff, 0, 0, 0, 0, 0, 0 };
+        unsigned d = 0;
+        bot(sp, 12, 0, NULL, 0, 10000, &d);
+        LOG("drive speed: %s (%d KB/s)", speed_now == 0xffff ? "maximum" : "quiet", speed_now);
+        speed_now = 0;
+    }
     int st = bot(h->cmdp, h->cmd_len, dir_in, h->dxferp, len, timeout, &done);
     h->status = 0; h->masked_status = 0; h->msg_status = 0; h->sb_len_wr = 0;
     h->host_status = 0; h->driver_status = 0; h->info = 0;

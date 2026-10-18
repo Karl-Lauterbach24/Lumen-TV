@@ -38,6 +38,8 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
 
     companion object {
         var READ_BUFFER_MB = 16
+        /** 2× Blu-ray: above any Blu-ray's rate, and quiet */
+        const val QUIET_KBS = 9000
         @Volatile private var bridgeOwner: MakeMkv? = null
         private var bridgeServer: Thread? = null
 
@@ -304,17 +306,35 @@ class MakeMkv(private val activity: Activity, private val log: (String) -> Unit)
         val mode = when (cacheMode) {
             "ram" -> "ram"
             "storage" -> if (diskAuto >= 64 * mb || (cacheMb > 0 && freeDisk - cacheMb * mb > 100 * mb)) "storage" else "ram"
-            else -> if (bigRam || mi.availMem >= 160 * mb || diskAuto < 128 * mb || isSwapping()) "ram" else "storage"
+            // (storage when there is room: a cache of minutes, so a drive that pauses never stops the film, and a quiet drive)
+            else -> if (bigRam || diskAuto < 256 * mb) "ram" else "storage"
         }
         val why = "television: ${mi.totalMem / mb} MB memory (${mi.availMem / mb} free), ${freeDisk / mb} MB storage free; setting ${cacheMode}/${if (cacheMb > 0) "$cacheMb MB" else "auto"}"
         return if (mode == "ram") {
             val want = if (cacheMb > 0) cacheMb * mb else ramAuto
             CachePlan(null, want.coerceIn(16 * mb, 1024 * mb), why)
         } else {
-            val want = if (cacheMb > 0) minOf(cacheMb * mb, freeDisk - 100 * mb) else diskAuto
+            val want = if (cacheMb > 0) minOf(cacheMb * mb, freeDisk - 100 * mb) else minOf(diskAuto, 384 * mb)
             CachePlan(File(cacheDir, "stream.cache"), want.coerceAtLeast(32 * mb), why)
         }
     }
+
+    /**
+     * The drive's read speed for the drive shim: 0 = as fast as it can (filling the cache, starting, after a jump), else KB/s
+     * (QUIET_KBS: enough for any Blu-ray, and much quieter than full speed).
+     */
+    /** Quick start (see MainActivity.warmMakeMkv): on unless switched off. */
+    var quickStart: Boolean
+        get() = prefs.getBoolean("quickstart", true)
+        set(v) { prefs.edit().putBoolean("quickstart", v).apply() }
+
+    fun driveSpeed(kbs: Int) {
+        if (kbs == lastSpeed) return
+        lastSpeed = kbs
+        try { File(root, "tmp/.mmshim.speed").writeText(kbs.toString()) } catch (_: Exception) { }
+        log("drive speed: ${if (kbs == 0) "full" else "quiet ($kbs KB/s)"}")
+    }
+    private var lastSpeed = -1
 
     /** The television swaps (its storage is then busy enough) */
     private fun isSwapping(): Boolean = try {
@@ -772,7 +792,7 @@ private const val HEAD_START = 48L shl 20
 private const val STORAGE_RATE = 4L shl 20
 
 class PipeStream(private val fifo: File, private val capacity: Long, private val file: File?, private val stats: (String) -> Unit,
-                 private val hold: (Boolean) -> Unit = {}) {
+                 private val hold: (Boolean) -> Unit = {}, private val level: (Double) -> Unit = {}) {
     private val lock = Object()
     private val mem: java.nio.ByteBuffer? = if (file == null) java.nio.ByteBuffer.allocateDirect(capacity.toInt()) else null
     private val disk: java.nio.channels.FileChannel? = file?.let { java.io.RandomAccessFile(it, "rw").channel }
@@ -785,6 +805,7 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
     @Volatile var position = 0L; private set
     private var t0 = 0L; private var tl = 0L; private var lastPos = 0L; private var lastWritten = 0L
     private var minAhead = Long.MAX_VALUE
+    private var tlLevel = 0L
 
     fun ahead(): Long = written - position
 
@@ -949,6 +970,7 @@ class PipeStream(private val fifo: File, private val capacity: Long, private val
             lock.notifyAll()
         }
         val now = System.currentTimeMillis()
+        if (now - tlLevel >= 1000) { tlLevel = now; level((written - position).toDouble() / (capacity - keepBehind)) }
         if (now - tl >= 5000) {
             stats("stream: played %.1f MB, cache %s %.0f MB ahead (least %.0f MB), MakeMKV held %d×, %d clusters, in %.2f MB/s, out %.2f MB/s".format(java.util.Locale.ROOT,
                 position / 1e6, where, (written - position) / 1e6, minAhead / 1e6, holds, idxMs.size,
